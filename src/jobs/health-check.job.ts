@@ -7,5 +7,5 @@ type Log = ReturnType<typeof createJobLogger>;
 export async function executeHealthCheck(log: Log): Promise<void>  {
   const now = new Date();
 
-  log.info(`BATCH 헬스 체크 ${now}`);
+  log.info(`BATCH 헬스 체크 ${process.env.JOB_HEALTH_CHECK}`);
 }
