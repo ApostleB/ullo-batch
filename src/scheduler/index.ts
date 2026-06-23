@@ -5,12 +5,22 @@ import { registerJob } from './common';
 // import * as billing from '../jobs/subscription-billing.job';
 import * as rolling from '../jobs/rolling-schedule.job';
 import * as settlement from '../jobs/auto-settlement.job';
+import * as healthCheck from '../jobs/health-check.job';
 
 const jobs: schedule.Job[] = [];
 
 export function startScheduler(): void {
   logger.info('스케줄러 시작');
 
+  //스케쥴러 헬스 체크
+  registerJob(jobs, {
+    name: healthCheck.JOB_NAME,
+    cron: config.jobs.systemHealthCheck.cron,
+    retries: 0,
+    execute: healthCheck.executeHealthCheck
+  })
+
+  //토스 결제 미사용으로 다음 정책이 나올떄까지 비활성화
   // 구독 정기결제 — 매일 21:00 (재시도는 매일 20:00). 잡 내부에서 건별 처리하므로 p-retry는 0.
   // registerJob(jobs, {
   //   name: billing.PRIMARY_JOB_NAME,

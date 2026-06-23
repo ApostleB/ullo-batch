@@ -29,6 +29,8 @@ export const config = {
     billingRetry: { cron: process.env.JOB_BILLING_RETRY_CRON ?? '0 20 * * *' },
     rollingSchedule: { cron: process.env.JOB_ROLLING_SCHEDULE_CRON ?? '0 3 * * *' },
     autoSettlement: { cron: process.env.JOB_AUTO_SETTLEMENT_CRON ?? '0 4 1 * *' },
+    systemHealthCheck: { cron: process.env.JOB_HEALTH_CHECK ?? '* * * * *' },
+
   },
   params: {
     rollingHorizonDays: num(process.env.ROLLING_HORIZON_DAYS, 30),
