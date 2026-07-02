@@ -1,7 +1,7 @@
-import { Between } from 'typeorm';
 import { AppDataSource } from '../db/data-source';
 import { Studio } from '../entities/studio.entity';
 import { MemberClassSession } from '../entities/member-class-session.entity';
+import { ClassSchedule } from '../entities/class-schedule.entity';
 import { Settlement } from '../entities/settlement.entity';
 import { SettlementPolicy } from '../entities/settlement-policy.entity';
 import { ActiveStatus, IsYn, SessionStatus, SettlementStatus } from '../entities/enums';
@@ -18,8 +18,11 @@ export async function execute(log: Log): Promise<void> {
   const now = new Date();
   const periodStart = new Date(now.getFullYear(), now.getMonth() - 1, 1, 0, 0, 0, 0);
   const periodEnd = new Date(now.getFullYear(), now.getMonth(), 0, 0, 0, 0, 0); // 전월 말일
-  const periodEndOfDay = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
   log.info(`정산 기간: ${ymd(periodStart)} ~ ${ymd(periodEnd)}`);
+
+  // 집계 기준일은 'YYYY-MM-DD' 문자열 (scheduled_date는 date 컬럼)
+  const periodStartYmd = ymd(periodStart);
+  const periodEndYmd = ymd(periodEnd);
 
   const studios = await AppDataSource.getRepository(Studio).find({ where: { is_del: IsYn.N } });
   const sessionRepo = AppDataSource.getRepository(MemberClassSession);
@@ -43,14 +46,19 @@ export async function execute(log: Log): Promise<void> {
       continue;
     }
 
-    const totalSessions = await sessionRepo.count({
-      where: {
-        studio_id: studio.studio_id,
-        session_status: SessionStatus.COMPLETED,
-        is_del: IsYn.N,
-        created_at: Between(periodStart, periodEndOfDay),
-      },
-    });
+    // 실제 수업일(class_schedule.scheduled_date) 기준으로 전월 완료 세션 집계.
+    // session.created_at(행 생성 시각)은 수업 진행일과 무관하므로 사용하지 않는다.
+    const totalSessions = await sessionRepo
+      .createQueryBuilder('session')
+      .innerJoin(ClassSchedule, 'sch', 'sch.class_schedule_id = session.class_schedule_id')
+      .where('session.studio_id = :studioId', { studioId: studio.studio_id })
+      .andWhere('session.session_status = :status', { status: SessionStatus.COMPLETED })
+      .andWhere('session.is_del = :isDel', { isDel: IsYn.N })
+      .andWhere('sch.scheduled_date BETWEEN :start AND :end', {
+        start: periodStartYmd,
+        end: periodEndYmd,
+      })
+      .getCount();
     if (totalSessions === 0) {
       skipped += 1;
       continue;

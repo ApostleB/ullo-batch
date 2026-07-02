@@ -10,6 +10,18 @@ export function parseLocalDate(s: string): Date {
   return new Date(y, m - 1, d, 0, 0, 0, 0);
 }
 
+/**
+ * TypeORM date 컬럼 값(런타임에는 'YYYY-MM-DD' 문자열, 혹은 Date)을 로컬 자정 Date로 정규화.
+ * new Date('YYYY-MM-DD')는 UTC 자정으로 파싱되어 음수 오프셋/경계일에서 하루가 어긋나므로
+ * 문자열은 parseLocalDate로 처리한다.
+ */
+export function toLocalDate(v: Date | string): Date {
+  if (typeof v === 'string') return parseLocalDate(v.slice(0, 10));
+  const r = new Date(v);
+  r.setHours(0, 0, 0, 0);
+  return r;
+}
+
 /** 오늘 로컬 자정 */
 export function today(): Date {
   const d = new Date();
@@ -51,6 +63,9 @@ export function toTimeString(min: number): string {
 }
 
 const DOW = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'] as const;
+
+/** dowCode()가 사용하는 유효 요일 코드 집합 */
+export const DOW_CODES: ReadonlySet<string> = new Set(DOW);
 
 /** Date → 요일 코드 (SUN..SAT) */
 export function dowCode(d: Date): string {

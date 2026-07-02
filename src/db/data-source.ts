@@ -16,6 +16,7 @@ import { ClassHoliday } from '../entities/class-holiday.entity';
 import { MemberClassSession } from '../entities/member-class-session.entity';
 import { Settlement } from '../entities/settlement.entity';
 import { SettlementPolicy } from '../entities/settlement-policy.entity';
+import { Holiday } from '../entities/holiday.entity';
 
 export const AppDataSource = new DataSource({
   type: 'postgres',
@@ -42,5 +43,6 @@ export const AppDataSource = new DataSource({
     MemberClassSession,
     Settlement,
     SettlementPolicy,
+    Holiday,
   ],
 });

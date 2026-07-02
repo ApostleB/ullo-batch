@@ -1,4 +1,4 @@
-import { EntityManager, IsNull, LessThanOrEqual } from 'typeorm';
+import { EntityManager, IsNull, LessThanOrEqual, Not } from 'typeorm';
 import { AppDataSource } from '../db/data-source';
 import { MemberPlan } from '../entities/member-plan.entity';
 import { MemberBilling } from '../entities/member-billing.entity';
@@ -35,8 +35,9 @@ export async function executePrimary(log: Log): Promise<void> {
 /** 매일 20:00 — 전일 실패(PAST_DUE) 구독 재시도, 실패 시 즉시 정지 */
 export async function executeRetry(log: Log): Promise<void> {
   const repo = AppDataSource.getRepository(MemberPlan);
+  // next_charge_dt가 null이면 결제 주기 계산이 1970년 기준으로 깨지므로 대상에서 제외한다.
   const pastDue = await repo.find({
-    where: { is_del: IsYn.N, status: PlanStatus.PAST_DUE },
+    where: { is_del: IsYn.N, status: PlanStatus.PAST_DUE, next_charge_dt: Not(IsNull()) },
   });
   log.info(`재시도 대상(PAST_DUE): ${pastDue.length}건`);
   await processPlans(pastDue, PlanStatus.SUSPENDED, log);
@@ -65,6 +66,12 @@ async function processOne(
   onFailStatus: string,
   log: Log,
 ): Promise<'charged' | 'skipped' | 'failed'> {
+  // 0) next_charge_dt 없으면 결제 주기 계산 불가 — 안전하게 스킵 (쿼리에서 거르지만 방어적으로 재확인)
+  if (!plan.next_charge_dt) {
+    log.warn(`next_charge_dt 없음 — 결제 스킵 plan=${plan.member_plan_id}`);
+    return 'skipped';
+  }
+
   // 1) 빌링키 / 플랜 로드 (트랜잭션 밖)
   const billing = plan.member_billing_id
     ? await AppDataSource.getRepository(MemberBilling).findOne({

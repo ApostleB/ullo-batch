@@ -6,6 +6,7 @@ import { registerJob } from './common';
 import * as rolling from '../jobs/rolling-schedule.job';
 import * as settlement from '../jobs/auto-settlement.job';
 import * as healthCheck from '../jobs/health-check.job';
+import * as holiday from '../jobs/holiday.job';
 
 const jobs: schedule.Job[] = [];
 
@@ -49,6 +50,14 @@ export function startScheduler(): void {
     cron: config.jobs.autoSettlement.cron,
     retries: 2,
     execute: settlement.execute,
+  });
+
+  // 공휴일 동기화 — 매월 1일 02:00 (미래 3개월치 upsert)
+  registerJob(jobs, {
+    name: holiday.JOB_NAME,
+    cron: config.jobs.holiday.cron,
+    retries: 3,
+    execute: holiday.execute,
   });
 
   logger.info(`등록된 잡: ${jobs.length}개`);

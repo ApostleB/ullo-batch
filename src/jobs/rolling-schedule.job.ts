@@ -7,7 +7,7 @@ import { ClassHoliday } from '../entities/class-holiday.entity';
 import { StudioClass } from '../entities/studio-class.entity';
 import { ActiveStatus, IsYn } from '../entities/enums';
 import { config } from '../config';
-import { addDays, dowCode, toMinutes, toTimeString, today, ymd } from '../utils/date.util';
+import { addDays, dowCode, DOW_CODES, toLocalDate, toMinutes, toTimeString, today, ymd } from '../utils/date.util';
 import { createJobLogger } from '../logger';
 
 export const JOB_NAME = 'rolling-schedule';
@@ -75,11 +75,12 @@ async function rollOne(
   const scheduleRepo = AppDataSource.getRepository(ClassSchedule);
 
   // 생성 시작일 = max(오늘, 시작일)
+  // date 컬럼은 런타임에 'YYYY-MM-DD' 문자열로 들어오므로 toLocalDate로 정규화(UTC off-by-one 방지)
   let from = today();
-  if (tt.start_date && new Date(tt.start_date) > from) from = new Date(tt.start_date);
+  if (tt.start_date && toLocalDate(tt.start_date) > from) from = toLocalDate(tt.start_date);
   from.setHours(0, 0, 0, 0);
   // 종료일이 horizon보다 빠르면 그날까지만
-  const to = tt.end_date && new Date(tt.end_date) < horizonEnd ? new Date(tt.end_date) : horizonEnd;
+  const to = tt.end_date && toLocalDate(tt.end_date) < horizonEnd ? toLocalDate(tt.end_date) : horizonEnd;
   if (from > to) return 0;
 
   // 반복 요일
@@ -89,18 +90,28 @@ async function rollOne(
   const dowSet = new Set(repeatDays.map((r) => r.day_of_week).filter((v): v is string => !!v));
   if (dowSet.size === 0) return 0; // 반복 요일 미지정이면 생성 안 함
 
+  // 요일 코드 포맷 검증 — DB 값이 dowCode()의 'SUN'..'SAT'와 다르면 영원히 매칭되지 않아
+  // 조용히 0건이 생성된다. 유효 코드가 하나도 없으면 경고로 노출한다.
+  if (![...dowSet].some((d) => DOW_CODES.has(d))) {
+    log.warn(
+      `반복 요일 포맷 불일치 tt=${tt.class_time_table_id} values=[${[...dowSet].join(',')}] ` +
+        `(기대 포맷: ${[...DOW_CODES].join(',')})`,
+    );
+    return 0;
+  }
+
   // 이미 존재하는 스케줄 날짜 (삭제분 포함 → 되살리지 않음)
   const existing = await scheduleRepo.find({
     where: { class_time_table_id: tt.class_time_table_id, scheduled_date: Between(from, to) },
     select: { scheduled_date: true },
   });
-  const existingDates = new Set(existing.map((e) => (e.scheduled_date ? ymd(new Date(e.scheduled_date)) : '')));
+  const existingDates = new Set(existing.map((e) => (e.scheduled_date ? ymd(toLocalDate(e.scheduled_date)) : '')));
 
   // 휴일
   const holidays = await AppDataSource.getRepository(ClassHoliday).find({
     where: { class_id: cls.class_id, holiday_date: Between(from, to) },
   });
-  const holidaySet = new Set(holidays.map((h) => (h.holiday_date ? ymd(new Date(h.holiday_date)) : '')));
+  const holidaySet = new Set(holidays.map((h) => (h.holiday_date ? ymd(toLocalDate(h.holiday_date)) : '')));
 
   const slots = buildSlots(tt.start_time!, tt.end_time!, tt.duration!, tt.break_time ?? 0);
   if (slots.length === 0) return 0;
