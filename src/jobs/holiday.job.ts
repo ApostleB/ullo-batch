@@ -36,12 +36,14 @@ export async function execute(log: Log): Promise<void> {
     `공휴일 동기화 대상: ${months.map((m) => `${m.year}-${String(m.month).padStart(2, '0')}`).join(', ')}`,
   );
 
-  // 2) API 조회 (월별) → (locdate, seq) 기준 병합
-  const apiItems: HolidayApiItem[] = [];
+  // 2) API 조회 (월별) → (locdate, seq) 기준 병합(dedup).
+  //    같은 키가 중복되면 뒤 값으로 덮는다. (dedup 없이 두면 둘 다 insert로 분류돼 유니크 제약 위반 크래시)
+  const mergedMap = new Map<string, HolidayApiItem>();
   for (const { year, month } of months) {
     const items = await fetchHolidays(year, month);
-    apiItems.push(...items);
+    for (const item of items) mergedMap.set(`${item.locdate}_${item.seq}`, item);
   }
+  const apiItems: HolidayApiItem[] = [...mergedMap.values()];
   if (apiItems.length === 0) {
     log.info('API 공휴일 결과 없음 — 종료');
     return;

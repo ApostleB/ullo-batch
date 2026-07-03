@@ -52,11 +52,21 @@ export async function fetchHolidays(solYear: number, solMonth: number): Promise<
     },
   );
 
-  const { header, body } = res.data.response;
+  // 서비스키 오류 등에서는 _type=json 요청에도 XML 오류 envelope가 내려온다.
+  // 이 경우 res.data.response가 없어 구조분해가 불투명한 TypeError로 터지므로 먼저 형태를 검증한다.
+  // (런타임엔 XML 문자열일 수 있으므로 선언 타입을 신뢰하지 않고 unknown으로 다룬다.)
+  const rawData: unknown = res.data;
+  const response = res.data?.response;
+  if (!response?.header) {
+    const raw = typeof rawData === 'string' ? rawData.slice(0, 200) : JSON.stringify(rawData).slice(0, 200);
+    throw new Error(`공휴일 API 응답 형식 오류(예상 밖 응답): ${raw}`);
+  }
+
+  const { header, body } = response;
   if (header.resultCode !== '00') {
     throw new Error(`공휴일 API 오류: [${header.resultCode}] ${header.resultMsg}`);
   }
 
-  const items = body.items ? toArray((body.items as { item?: HolidayApiItem | HolidayApiItem[] }).item) : [];
+  const items = body?.items ? toArray((body.items as { item?: HolidayApiItem | HolidayApiItem[] }).item) : [];
   return items;
 }
