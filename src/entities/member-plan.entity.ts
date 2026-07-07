@@ -48,4 +48,11 @@ export class MemberPlan {
 
   @Column({ type: 'timestamp', nullable: true })
   canceled_at: Date | null;
+
+  // 가입 시점 가격 고정(price lock) — 청구 시 플랜 마스터가 아닌 이 값을 쓴다(소급 방지)
+  @Column({ type: 'integer', nullable: true })
+  locked_amount: number | null;
+
+  @Column({ type: 'integer', nullable: true })
+  locked_credit: number | null;
 }

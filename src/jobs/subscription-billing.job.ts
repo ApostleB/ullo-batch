@@ -97,7 +97,18 @@ async function processOne(
   const cycleYm = plan.next_charge_dt ? ymd(new Date(plan.next_charge_dt)).slice(0, 7).replace('-', '') : 'NA';
   const orderId = `sub_${plan.member_plan_id}_${cycleYm}`;
 
-  if (!billing || billing.is_active !== ActiveStatus.Y || !pl || (pl.actual_amount ?? 0) <= 0) {
+  // 가격 고정(price lock): 플랜 변경(pending_plan_id) 주기가 아니면 가입 시 고정가(locked)를
+  // 청구한다(관리자의 플랜 마스터 가격 변경이 기존 구독자에게 소급되지 않도록). 변경 주기이면
+  // 새 플랜의 현재가를 청구하고 아래 성공 처리에서 그 값으로 재고정한다. 구 데이터(locked null)는
+  // 현재 플랜가로 폴백한 뒤 그 값으로 고정된다.
+  const isPlanChange = !!plan.pending_plan_id;
+  const amount = isPlanChange
+    ? (pl?.actual_amount ?? 0)
+    : (plan.locked_amount ?? pl?.actual_amount ?? 0);
+  const grant = isPlanChange ? (pl?.credit ?? 0) : (plan.locked_credit ?? pl?.credit ?? 0);
+  const orderName = pl?.plan_title ?? '구독 결제';
+
+  if (!billing || billing.is_active !== ActiveStatus.Y || !pl || amount <= 0) {
     log.warn(`결제 불가(빌링/플랜 없음) plan=${plan.member_plan_id} → ${onFailStatus}`);
     await markFailed(plan, onFailStatus, orderId, null, 'NO_BILLING_OR_PLAN', '빌링키 또는 플랜이 유효하지 않음');
     return 'failed';
@@ -110,10 +121,6 @@ async function processOne(
     await advancePlanOnly(plan, effectivePlanId);
     return 'skipped';
   }
-
-  const amount = pl.actual_amount!;
-  const grant = pl.credit ?? 0;
-  const orderName = pl.plan_title ?? '구독 결제';
 
   // 3) 자동결제 (트랜잭션 밖) — 빌링키의 PG(provider)에 따라 토스/이니시스 분기.
   //    provider NULL 또는 'TOSS' = 레거시 토스 빌링키(이니시스 마이그레이션 이전 발급분).
@@ -216,6 +223,10 @@ async function processOne(
         next_charge_dt: newNextCharge,
         end_dt: newNextCharge, // 결제 성공 시 이용기간(end_dt)도 다음 주기까지 연장
         last_payment_id: savedPayment.payment_id,
+        // 이번에 청구한 금액/크레딧으로 가격 고정 갱신 (플랜 변경 주기면 새 플랜가로 재고정,
+        // 구 데이터면 폴백값으로 최초 고정)
+        locked_amount: amount,
+        locked_credit: grant,
         updated_at: now,
       },
     );
