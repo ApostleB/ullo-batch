@@ -7,6 +7,7 @@ import * as billing from './jobs/subscription-billing.job';
 import * as rolling from './jobs/rolling-schedule.job';
 import * as settlement from './jobs/auto-settlement.job';
 import * as holiday from './jobs/holiday.job';
+import * as memberPurge from './jobs/member-purge.job';
 
 type Exec = (log: ReturnType<typeof createJobLogger>) => Promise<void>;
 
@@ -16,6 +17,7 @@ const registry: Record<string, { name: string; execute: Exec }> = {
   rolling: { name: rolling.JOB_NAME, execute: rolling.execute },
   settlement: { name: settlement.JOB_NAME, execute: settlement.execute },
   holiday: { name: holiday.JOB_NAME, execute: holiday.execute },
+  'member-purge': { name: memberPurge.JOB_NAME, execute: memberPurge.execute },
 };
 
 async function main(): Promise<void> {
