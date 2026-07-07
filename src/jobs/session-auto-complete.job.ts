@@ -19,26 +19,36 @@ type Log = ReturnType<typeof createJobLogger>;
  */
 export async function execute(log: Log): Promise<void> {
   const graceHours = config.params.sessionAutoCompleteGraceHours;
+  const fromDate = config.params.sessionAutoCompleteFromDate; // 'YYYY-MM-DD' | null
+  const dryRun = config.params.sessionAutoCompleteDryRun;
 
-  // BOOKED + 삭제 안 됨 + 종료시각이 (now - grace) 이전
+  // BOOKED + 삭제 안 됨 + 종료시각이 (now - grace) 이전 + (하한일 지정 시) 그 이후 수업만
   const whereSql = `
     mcs.session_status = 'BOOKED'
     AND COALESCE(mcs.is_del::text, 'N') = 'N'
     AND COALESCE(sch.is_del::text, 'N') <> 'Y'
     AND sch.end_time IS NOT NULL
     AND (sch.scheduled_date + sch.end_time) < (now() - ($1::int * interval '1 hour'))
+    AND ($2::date IS NULL OR sch.scheduled_date >= $2::date)
   `;
+  const params = [graceHours, fromDate];
 
   const countRows: Array<{ cnt: number }> = await AppDataSource.query(
     `SELECT COUNT(*)::int AS cnt
        FROM member_class_session mcs
        JOIN studio_class_schedule sch ON sch.class_schedule_id = mcs.class_schedule_id
       WHERE ${whereSql}`,
-    [graceHours],
+    params,
   );
   const targetCount = countRows[0]?.cnt ?? 0;
-  log.info(`자동완료 대상(BOOKED, 종료+${graceHours}h 경과): ${targetCount}건`);
+  const scope = fromDate ? `, ${fromDate} 이후` : '';
+  log.info(`자동완료 대상(BOOKED, 종료+${graceHours}h 경과${scope}): ${targetCount}건`);
   if (targetCount === 0) return;
+
+  if (dryRun) {
+    log.warn(`DRY-RUN — 실제 전이 없이 종료 (대상 ${targetCount}건). 적용하려면 SESSION_AUTO_COMPLETE_DRY_RUN 해제.`);
+    return;
+  }
 
   const updated: Array<{ member_class_session_id: string }> = await AppDataSource.query(
     `UPDATE member_class_session mcs
@@ -48,7 +58,7 @@ export async function execute(log: Log): Promise<void> {
       WHERE sch.class_schedule_id = mcs.class_schedule_id
         AND ${whereSql}
       RETURNING mcs.member_class_session_id`,
-    [graceHours],
+    params,
   );
 
   log.info(`수업 종료 자동완료: 대상 ${targetCount}건 → COMPLETED ${updated.length}건`);

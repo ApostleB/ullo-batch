@@ -10,6 +10,8 @@ import * as holiday from '../jobs/holiday.job';
 import * as memberPurge from '../jobs/member-purge.job';
 // 수업 종료 자동완료 잡 — 아래 registerJob 주석 해제 시 이 import도 함께 활성화.
 // import * as sessionAutoComplete from '../jobs/session-auto-complete.job';
+// 결제창 이탈 READY 정리 잡 — 아래 registerJob 주석 해제 시 이 import도 함께 활성화.
+// import * as paymentReadyCleanup from '../jobs/payment-ready-cleanup.job';
 
 const jobs: schedule.Job[] = [];
 
@@ -73,13 +75,23 @@ export function startScheduler(): void {
 
   // 수업 종료 자동 완료 — 매일 02:30 (종료+grace 경과 BOOKED → COMPLETED).
   // ⚠️ 최초 활성화 시 과거 미완료 BOOKED가 한꺼번에 COMPLETED로 소급되어 정산·리뷰에 반영된다.
-  //   활성화 전 반드시 `npm run job session-auto-complete`로 대상 건수를 먼저 확인할 것.
-  //   (백필 범위/기준일 정책 확정 후 아래 주석 해제)
+  //   활성화 전 SESSION_AUTO_COMPLETE_DRY_RUN=true 로 `npm run job session-auto-complete` 실행해 대상 건수만 먼저 확인.
+  //   백로그가 크면 SESSION_AUTO_COMPLETE_FROM_DATE='YYYY-MM-DD'로 하한일을 정한 뒤 아래 주석 해제.
   // registerJob(jobs, {
   //   name: sessionAutoComplete.JOB_NAME,
   //   cron: config.jobs.sessionAutoComplete.cron,
   //   retries: 1,
   //   execute: sessionAutoComplete.execute,
+  // });
+
+  // 결제창 이탈 READY 정리 — 매일 01:00 (요청 후 grace 경과 READY → ABORTED).
+  // ⚠️ 활성화 전 확인: 오래된 READY가 비동기 승인(웹훅 등)으로 DONE 되는 경로가 없는지.
+  //   있다면 PAYMENT_READY_ABORT_HOURS를 그 지연보다 길게. 먼저 `npm run job payment-ready-cleanup`로 대상 확인.
+  // registerJob(jobs, {
+  //   name: paymentReadyCleanup.JOB_NAME,
+  //   cron: config.jobs.paymentReadyCleanup.cron,
+  //   retries: 1,
+  //   execute: paymentReadyCleanup.execute,
   // });
 
   logger.info(`등록된 잡: ${jobs.length}개`);

@@ -47,6 +47,7 @@ export const config = {
     holiday: { cron: process.env.JOB_HOLIDAY_CRON ?? '0 2 1 * *' }, // 매월 1일 02:00
     memberPurge: { cron: process.env.JOB_MEMBER_PURGE_CRON ?? '0 5 * * *' }, // 매일 05:00
     sessionAutoComplete: { cron: process.env.JOB_SESSION_AUTO_COMPLETE_CRON ?? '30 2 * * *' }, // 매일 02:30 (정산 전)
+    paymentReadyCleanup: { cron: process.env.JOB_PAYMENT_READY_CLEANUP_CRON ?? '0 1 * * *' }, // 매일 01:00
   },
   params: {
     rollingHorizonDays: num(process.env.ROLLING_HORIZON_DAYS, 30),
@@ -55,5 +56,11 @@ export const config = {
     holidayHorizonMonths: num(process.env.HOLIDAY_HORIZON_MONTHS, 3),
     // 수업 종료 후 이 시간(h)이 지난 BOOKED 세션만 자동완료 — 파트너 NO_SHOW 정정 유예.
     sessionAutoCompleteGraceHours: num(process.env.SESSION_AUTO_COMPLETE_GRACE_HOURS, 24),
+    // 미리보기 모드 — true면 대상 건수만 로깅하고 실제 UPDATE는 하지 않음(활성화 전 백로그 확인용).
+    sessionAutoCompleteDryRun: (process.env.SESSION_AUTO_COMPLETE_DRY_RUN ?? '').trim().toLowerCase() === 'true',
+    // 백필 하한일('YYYY-MM-DD') — 지정 시 이 날짜 이후 수업만 자동완료(과거 대량 소급 방지). 미지정이면 전체.
+    sessionAutoCompleteFromDate: (process.env.SESSION_AUTO_COMPLETE_FROM_DATE ?? '').trim() || null,
+    // 결제창 이탈 READY 주문: 요청 후 이 시간(h) 경과분을 ABORTED로 정리.
+    paymentReadyAbortHours: num(process.env.PAYMENT_READY_ABORT_HOURS, 24),
   },
 } as const;

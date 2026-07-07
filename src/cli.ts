@@ -9,6 +9,7 @@ import * as settlement from './jobs/auto-settlement.job';
 import * as holiday from './jobs/holiday.job';
 import * as memberPurge from './jobs/member-purge.job';
 import * as sessionAutoComplete from './jobs/session-auto-complete.job';
+import * as paymentReadyCleanup from './jobs/payment-ready-cleanup.job';
 
 type Exec = (log: ReturnType<typeof createJobLogger>) => Promise<void>;
 
@@ -20,6 +21,7 @@ const registry: Record<string, { name: string; execute: Exec }> = {
   holiday: { name: holiday.JOB_NAME, execute: holiday.execute },
   'member-purge': { name: memberPurge.JOB_NAME, execute: memberPurge.execute },
   'session-auto-complete': { name: sessionAutoComplete.JOB_NAME, execute: sessionAutoComplete.execute },
+  'payment-ready-cleanup': { name: paymentReadyCleanup.JOB_NAME, execute: paymentReadyCleanup.execute },
 };
 
 async function main(): Promise<void> {
