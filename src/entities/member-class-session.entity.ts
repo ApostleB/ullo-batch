@@ -27,6 +27,10 @@ export class MemberClassSession {
   @Column({ type: 'timestamp', nullable: true })
   created_at: Date | null;
 
+  /** 수업 완료 시각 — 파트너 수동 완료 또는 session-auto-complete 잡이 채운다(리뷰 허용기간 기준). */
+  @Column({ type: 'timestamp', nullable: true })
+  completed_at: Date | null;
+
   @Column({ type: 'integer', nullable: true })
   credit_amount: number | null;
 }

@@ -46,11 +46,14 @@ export const config = {
     systemHealthCheck: { cron: process.env.JOB_HEALTH_CHECK ?? '* * * * *' },
     holiday: { cron: process.env.JOB_HOLIDAY_CRON ?? '0 2 1 * *' }, // 매월 1일 02:00
     memberPurge: { cron: process.env.JOB_MEMBER_PURGE_CRON ?? '0 5 * * *' }, // 매일 05:00
+    sessionAutoComplete: { cron: process.env.JOB_SESSION_AUTO_COMPLETE_CRON ?? '30 2 * * *' }, // 매일 02:30 (정산 전)
   },
   params: {
     rollingHorizonDays: num(process.env.ROLLING_HORIZON_DAYS, 30),
     settlementDefaultUnitPrice: num(process.env.SETTLEMENT_DEFAULT_UNIT_PRICE, 10000),
     settlementDefaultCommissionRate: num(process.env.SETTLEMENT_DEFAULT_COMMISSION_RATE, 0.1),
     holidayHorizonMonths: num(process.env.HOLIDAY_HORIZON_MONTHS, 3),
+    // 수업 종료 후 이 시간(h)이 지난 BOOKED 세션만 자동완료 — 파트너 NO_SHOW 정정 유예.
+    sessionAutoCompleteGraceHours: num(process.env.SESSION_AUTO_COMPLETE_GRACE_HOURS, 24),
   },
 } as const;
