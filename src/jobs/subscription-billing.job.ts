@@ -8,6 +8,7 @@ import { MemberCredit } from '../entities/member-credit.entity';
 import { MemberCreditLog } from '../entities/member-credit-log.entity';
 import { ActiveStatus, IsYn, PaymentStatus, PlanStatus } from '../entities/enums';
 import { chargeBilling } from '../utils/toss-billing.client';
+import { chargeInicisBilling } from '../utils/inicis-billing.client';
 import { addMonthsClamped, today, ymd } from '../utils/date.util';
 import { createJobLogger } from '../logger';
 
@@ -18,6 +19,14 @@ export const RETRY_JOB_NAME = 'subscription-billing-retry';
 const CREDIT_VALID_MONTHS = 1;
 
 type Log = ReturnType<typeof createJobLogger>;
+
+/** PG 무관하게 결제 성공 결과를 표준화 — Payment 기록에 그대로 매핑된다. */
+interface ChargeResult {
+  pgProvider: string; // 'toss' | 'inicis'
+  paymentKey: string | null;
+  method: string | null;
+  transactionId: string | null;
+}
 
 /** 매일 21:00 — ACTIVE 구독 중 결제일 도래분 청구 */
 export async function executePrimary(log: Log): Promise<void> {
@@ -106,19 +115,32 @@ async function processOne(
   const grant = pl.credit ?? 0;
   const orderName = pl.plan_title ?? '구독 결제';
 
-  // 3) 토스 자동결제 (트랜잭션 밖)
-  let tossRes;
+  // 3) 자동결제 (트랜잭션 밖) — 빌링키의 PG(provider)에 따라 토스/이니시스 분기.
+  //    provider NULL 또는 'TOSS' = 레거시 토스 빌링키(이니시스 마이그레이션 이전 발급분).
+  const provider = (billing.provider ?? 'TOSS').toUpperCase();
+  let charge: ChargeResult;
   try {
-    tossRes = await chargeBilling({
-      billingKey: billing.billing_key,
-      customerKey: billing.customer_key,
-      amount,
-      orderId,
-      orderName,
-    });
+    if (provider === 'INICIS') {
+      const r = await chargeInicisBilling({ billKey: billing.billing_key, amount, orderId, orderName });
+      charge = { pgProvider: 'inicis', paymentKey: r.tid, method: r.method, transactionId: r.tid };
+    } else {
+      const r = await chargeBilling({
+        billingKey: billing.billing_key,
+        customerKey: billing.customer_key,
+        amount,
+        orderId,
+        orderName,
+      });
+      charge = {
+        pgProvider: 'toss',
+        paymentKey: r?.paymentKey ?? null,
+        method: r?.method ?? null,
+        transactionId: r?.lastTransactionKey ?? null,
+      };
+    }
   } catch (err) {
     const e = err as { code?: string; message?: string };
-    log.warn(`결제 실패 plan=${plan.member_plan_id} [${e.code}] ${e.message} → ${onFailStatus}`);
+    log.warn(`결제 실패 plan=${plan.member_plan_id} provider=${provider} [${e.code}] ${e.message} → ${onFailStatus}`);
     await markFailed(plan, onFailStatus, orderId, amount, e.code ?? null, e.message ?? null);
     return 'failed';
   }
@@ -137,10 +159,10 @@ async function processOne(
       status: PaymentStatus.DONE,
       order_id: orderId,
       order_name: orderName,
-      pg_provider: 'toss',
-      payment_key: tossRes?.paymentKey ?? null,
-      method: tossRes?.method ?? null,
-      pg_transaction_id: tossRes?.lastTransactionKey ?? null,
+      pg_provider: charge.pgProvider,
+      payment_key: charge.paymentKey,
+      method: charge.method,
+      pg_transaction_id: charge.transactionId,
       paid_at: now,
       requested_at: now,
       updated_at: now,
