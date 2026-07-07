@@ -42,7 +42,9 @@ export const config = {
     billing: { cron: process.env.JOB_BILLING_CRON ?? '0 21 * * *' },
     billingRetry: { cron: process.env.JOB_BILLING_RETRY_CRON ?? '0 20 * * *' },
     rollingSchedule: { cron: process.env.JOB_ROLLING_SCHEDULE_CRON ?? '0 3 * * *' },
-    autoSettlement: { cron: process.env.JOB_AUTO_SETTLEMENT_CRON ?? '0 4 1 * *' },
+    // 매월 5일 04:00 — 1일이 아니라 5일. 월말 수업이 auto-complete grace(기본 24h)로 늦게 COMPLETED돼도
+    // 정산 멱등 잠금 전에 집계되도록 여유를 둔다(월말 경계 정산 누락 방지). grace를 늘리면 이 날짜도 함께 뒤로.
+    autoSettlement: { cron: process.env.JOB_AUTO_SETTLEMENT_CRON ?? '0 4 5 * *' },
     systemHealthCheck: { cron: process.env.JOB_HEALTH_CHECK ?? '* * * * *' },
     holiday: { cron: process.env.JOB_HOLIDAY_CRON ?? '0 2 1 * *' }, // 매월 1일 02:00
     memberPurge: { cron: process.env.JOB_MEMBER_PURGE_CRON ?? '0 5 * * *' }, // 매일 05:00
@@ -54,7 +56,9 @@ export const config = {
     settlementDefaultUnitPrice: num(process.env.SETTLEMENT_DEFAULT_UNIT_PRICE, 10000),
     settlementDefaultCommissionRate: num(process.env.SETTLEMENT_DEFAULT_COMMISSION_RATE, 0.1),
     holidayHorizonMonths: num(process.env.HOLIDAY_HORIZON_MONTHS, 3),
-    // 수업 종료 후 이 시간(h)이 지난 BOOKED 세션만 자동완료 — 파트너 NO_SHOW 정정 유예.
+    // 수업 종료 후 유예시간(h) = 파트너의 NO_SHOW 마킹 마감시한(SLA).
+    // 이 시간 내 미마킹분은 경과 후 COMPLETED로 확정된다 → 노쇼도 정산에 포함됨(정책: 기본 완료).
+    // 노쇼를 정산에서 제외하려면 체크인/출석 데이터가 선행 필요(현재 미보유).
     sessionAutoCompleteGraceHours: num(process.env.SESSION_AUTO_COMPLETE_GRACE_HOURS, 24),
     // 미리보기 모드 — true면 대상 건수만 로깅하고 실제 UPDATE는 하지 않음(활성화 전 백로그 확인용).
     sessionAutoCompleteDryRun: (process.env.SESSION_AUTO_COMPLETE_DRY_RUN ?? '').trim().toLowerCase() === 'true',

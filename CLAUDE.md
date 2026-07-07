@@ -58,7 +58,7 @@ index.ts → AppDataSource.initialize() → scheduler/index.ts:startScheduler()
 |---|---|---|---|
 | `system-health-check` | `* * * * *` (매분) | 0 | 서비스 생존 확인 |
 | `rolling-schedule` | `0 3 * * *` (매일 03:00) | 2 | 반복 시간표 → ClassSchedule 선행 생성 (`ROLLING_HORIZON_DAYS`일치) |
-| `auto-settlement` | `0 4 1 * *` (매월 1일 04:00) | 2 | 전월 완료 세션 집계 → Settlement 생성 (멱등) |
+| `auto-settlement` | `0 4 5 * *` (매월 5일 04:00) | 2 | 전월 완료 세션 집계 → Settlement 생성 (멱등). 5일인 이유: 월말 세션의 auto-complete grace가 닫힌 뒤 집계 |
 | `holiday` | `0 2 1 * *` (매월 1일 02:00) | 3 | 공공데이터포털 특일정보 → Holiday upsert (`HOLIDAY_HORIZON_MONTHS`개월치) |
 | `subscription-billing` | `0 21 * * *` | 0 | 구독 정기결제 — **스케줄러에서 주석 처리(비활성)** |
 | `subscription-billing-retry` | `0 20 * * *` | 0 | 전일 실패(PAST_DUE) 재시도 — **비활성** |

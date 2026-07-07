@@ -12,6 +12,10 @@ type Log = ReturnType<typeof createJobLogger>;
  * COMPLETED로 전이하고 completed_at을 실제 수업 종료시각으로 채운다.
  * 파트너 수동 출석처리(BOOKED→COMPLETED/NO_SHOW) 누락분의 안전망 — 정산·리뷰가 COMPLETED에 의존한다.
  *
+ * 정책: grace(유예)는 파트너의 NO_SHOW 마킹 마감시한(SLA)이며, 경과 후 미마킹분은 COMPLETED로 확정한다
+ *   (= 노쇼도 정산 포함. 출석 데이터가 없어 배치는 노쇼를 구분할 수 없다).
+ *   월말 경계 누락 방지를 위해 auto-settlement는 1일이 아닌 5일에 돈다(config 참고).
+ *
  * - BOOKED만 대상이라 재실행/중복 실행에 멱등(이미 COMPLETED/NO_SHOW/CANCELLED는 재선택 안 됨).
  * - completed_at은 배치 실행시각이 아니라 실제 수업 종료시각 — 리뷰 허용기간이 흔들리지 않게.
  * - 날짜 연산은 DB에서 수행(now()/make_interval)해 JS date 파싱의 KST off-by-one을 회피한다.

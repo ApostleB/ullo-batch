@@ -49,7 +49,7 @@ export function startScheduler(): void {
     execute: rolling.execute,
   });
 
-  // 정산 자동 생성 — 매월 1일 04:00
+  // 정산 자동 생성 — 매월 5일 04:00 (월말 auto-complete grace가 닫힌 뒤 집계 → 경계 누락 방지)
   registerJob(jobs, {
     name: settlement.JOB_NAME,
     cron: config.jobs.autoSettlement.cron,
