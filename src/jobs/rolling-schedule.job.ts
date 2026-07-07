@@ -52,7 +52,9 @@ export async function execute(log: Log): Promise<void> {
   let createdTotal = 0;
   for (const tt of timeTables) {
     const cls = tt.class_id ? classMap.get(tt.class_id) : undefined;
-    if (!cls || cls.is_del !== IsYn.N || cls.is_active !== ActiveStatus.Y) {
+    // is_del은 nullable — NULL은 "삭제 안 됨"을 뜻하는 관례이므로 명시적 삭제(Y)만 스킵한다.
+    // (기존 `!== IsYn.N`은 is_del=NULL 정상 클래스까지 삭제로 취급해 조용히 제외했음)
+    if (!cls || cls.is_del === IsYn.Y || cls.is_active !== ActiveStatus.Y) {
       continue; // 비활성/삭제 클래스 스킵
     }
     if (!tt.start_time || !tt.end_time || !tt.duration || tt.duration <= 0) {

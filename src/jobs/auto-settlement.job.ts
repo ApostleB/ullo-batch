@@ -54,6 +54,8 @@ export async function execute(log: Log): Promise<void> {
       .where('session.studio_id = :studioId', { studioId: studio.studio_id })
       .andWhere('session.session_status = :status', { status: SessionStatus.COMPLETED })
       .andWhere('session.is_del = :isDel', { isDel: IsYn.N })
+      // 소프트 삭제된 스케줄(취소 수업)은 정산에서 제외. IS DISTINCT FROM으로 is_del=NULL 행은 유지(정상 스케줄).
+      .andWhere('sch.is_del IS DISTINCT FROM :schDel', { schDel: IsYn.Y })
       .andWhere('sch.scheduled_date BETWEEN :start AND :end', {
         start: periodStartYmd,
         end: periodEndYmd,

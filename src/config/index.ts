@@ -22,6 +22,13 @@ export const config = {
     secretKey: process.env.TOSS_SECRET_KEY ?? '',
     baseUrl: 'https://api.tosspayments.com',
   },
+  inicis: {
+    // KG이니시스 빌링(자동결제) — 빌링 MID + INIAPI 2.0 빌링 key (ullo inipay.client.ts와 동일 자격증명)
+    billMid: process.env.INICIS_BILL_MID ?? '',
+    iniapiBillKey: process.env.INIAPI_BILL_KEY ?? '',
+    siteUrl: process.env.INICIS_SITE_URL ?? 'https://ullo.co.kr',
+    billingApiUrl: 'https://iniapi.inicis.com/v2/pg/billing',
+  },
   openApi: {
     // 공공데이터포털 서비스키 (디코딩된 값)
     serviceKey: process.env.PUBLIC_DATA_API_KEY ?? '',
@@ -38,6 +45,7 @@ export const config = {
     autoSettlement: { cron: process.env.JOB_AUTO_SETTLEMENT_CRON ?? '0 4 1 * *' },
     systemHealthCheck: { cron: process.env.JOB_HEALTH_CHECK ?? '* * * * *' },
     holiday: { cron: process.env.JOB_HOLIDAY_CRON ?? '0 2 1 * *' }, // 매월 1일 02:00
+    memberPurge: { cron: process.env.JOB_MEMBER_PURGE_CRON ?? '0 5 * * *' }, // 매일 05:00
   },
   params: {
     rollingHorizonDays: num(process.env.ROLLING_HORIZON_DAYS, 30),

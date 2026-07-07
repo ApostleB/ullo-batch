@@ -7,6 +7,7 @@ import * as rolling from '../jobs/rolling-schedule.job';
 import * as settlement from '../jobs/auto-settlement.job';
 import * as healthCheck from '../jobs/health-check.job';
 import * as holiday from '../jobs/holiday.job';
+import * as memberPurge from '../jobs/member-purge.job';
 
 const jobs: schedule.Job[] = [];
 
@@ -58,6 +59,14 @@ export function startScheduler(): void {
     cron: config.jobs.holiday.cron,
     retries: 3,
     execute: holiday.execute,
+  });
+
+  // 탈퇴 회원 분리보관 개인정보 파기 — 매일 05:00 (purge_at 경과분)
+  registerJob(jobs, {
+    name: memberPurge.JOB_NAME,
+    cron: config.jobs.memberPurge.cron,
+    retries: 1,
+    execute: memberPurge.execute,
   });
 
   logger.info(`등록된 잡: ${jobs.length}개`);
