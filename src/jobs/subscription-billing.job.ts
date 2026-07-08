@@ -9,6 +9,8 @@ import { MemberCreditLog } from '../entities/member-credit-log.entity';
 import { ActiveStatus, IsYn, PaymentStatus, PlanStatus } from '../entities/enums';
 import { chargeBilling } from '../utils/toss-billing.client';
 import { chargeInicisBilling } from '../utils/inicis-billing.client';
+import { decryptBillingKey } from '../utils/billing-crypto.util';
+import { config } from '../config';
 import { addMonthsClamped, today, ymd } from '../utils/date.util';
 import { createJobLogger } from '../logger';
 
@@ -125,14 +127,16 @@ async function processOne(
   // 3) 자동결제 (트랜잭션 밖) — 빌링키의 PG(provider)에 따라 토스/이니시스 분기.
   //    provider NULL 또는 'TOSS' = 레거시 토스 빌링키(이니시스 마이그레이션 이전 발급분).
   const provider = (billing.provider ?? 'TOSS').toUpperCase();
+  // 백엔드가 암호화 저장한 빌링키 복호화(레거시 평문은 그대로 통과) — BILLING_KEY_ENC_KEY 는 백엔드와 동일해야 함
+  const billKey = decryptBillingKey(billing.billing_key, config.billing.encKey);
   let charge: ChargeResult;
   try {
     if (provider === 'INICIS') {
-      const r = await chargeInicisBilling({ billKey: billing.billing_key, amount, orderId, orderName });
+      const r = await chargeInicisBilling({ billKey, amount, orderId, orderName });
       charge = { pgProvider: 'inicis', paymentKey: r.tid, method: r.method, transactionId: r.tid };
     } else {
       const r = await chargeBilling({
-        billingKey: billing.billing_key,
+        billingKey: billKey,
         customerKey: billing.customer_key,
         amount,
         orderId,

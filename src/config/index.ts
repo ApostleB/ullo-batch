@@ -29,6 +29,10 @@ export const config = {
     siteUrl: process.env.INICIS_SITE_URL ?? 'https://ullo.co.kr',
     billingApiUrl: 'https://iniapi.inicis.com/v2/pg/billing',
   },
+  billing: {
+    // member_billing.billing_key 복호화 secret — 백엔드(ullo)와 반드시 동일한 값
+    encKey: process.env.BILLING_KEY_ENC_KEY ?? '',
+  },
   openApi: {
     // 공공데이터포털 서비스키 (디코딩된 값)
     serviceKey: process.env.PUBLIC_DATA_API_KEY ?? '',
