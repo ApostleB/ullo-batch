@@ -26,6 +26,13 @@ export class Settlement {
   @Column({ type: 'integer', nullable: true })
   net_amount: number | null;
 
+  // 수동 조정(P3-8, 백엔드 admin) — 배치는 읽지 않지만 스키마 정합을 위해 미러.
+  @Column({ type: 'integer', nullable: true })
+  adjustment_amount: number | null;
+
+  @Column({ type: 'text', nullable: true })
+  adjustment_reason: string | null;
+
   @Column({ type: 'text', nullable: true })
   status: string | null;
 
