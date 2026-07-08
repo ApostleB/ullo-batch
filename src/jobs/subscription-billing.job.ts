@@ -191,6 +191,7 @@ async function processOne(
           credit: grant,
           membership_title: orderName,
           member_membership_id: plan.member_plan_id,
+          source_payment_id: savedPayment.payment_id, // 결제↔lot 링크 (환불 판정·회수 귀속)
           start_dt: start,
           end_dt: end,
           is_del: IsYn.N,

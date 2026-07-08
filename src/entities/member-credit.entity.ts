@@ -27,6 +27,10 @@ export class MemberCredit {
   @Column({ type: 'uuid', nullable: true })
   member_membership_id: string | null;
 
+  // 이 lot 을 지급한 결제 — 자동환불 판정·환불 회수 귀속용(백엔드 미러). 쿠폰/수동 지급은 null.
+  @Column({ type: 'uuid', nullable: true })
+  source_payment_id: string | null;
+
   @Column({ type: 'date', nullable: true })
   start_dt: Date | null;
 
