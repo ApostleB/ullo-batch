@@ -1,6 +1,9 @@
-import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
+import { Column, Entity, Index, PrimaryGeneratedColumn } from 'typeorm';
 
+// 멱등 백업 — (studio_id, period_start) 부분 유니크(취소 제외). 백엔드 DDL settlement_studio_period_uq와 정합.
+// synchronize:false 이므로 실효는 수동 DDL 적용에 달려 있고, 이 선언은 스키마 문서화 목적.
 @Entity('settlement')
+@Index('settlement_studio_period_uq', ['studio_id', 'period_start'], { unique: true, where: "status <> 'CANCELLED'" })
 export class Settlement {
   @PrimaryGeneratedColumn('uuid')
   settlement_id: string;

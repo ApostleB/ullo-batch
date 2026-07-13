@@ -1,3 +1,4 @@
+import { Not } from 'typeorm';
 import { AppDataSource } from '../db/data-source';
 import { Studio } from '../entities/studio.entity';
 import { MemberClassSession } from '../entities/member-class-session.entity';
@@ -37,9 +38,11 @@ export async function execute(log: Log): Promise<void> {
   let created = 0;
   let skipped = 0;
   for (const studio of studios) {
-    // 멱등 — 같은 (studio, 기간) 정산 있으면 스킵
+    // 멱등 — 같은 (studio, 기간)에 '취소되지 않은' 정산이 있으면 스킵.
+    // 백엔드 부분 유니크(settlement_studio_period_uq WHERE status<>'CANCELLED')와 대칭:
+    // 취소된 정산만 있으면 재생성 허용(취소-후-재생성 정책).
     const dup = await settlementRepo.findOne({
-      where: { studio_id: studio.studio_id, period_start: periodStart },
+      where: { studio_id: studio.studio_id, period_start: periodStart, status: Not(SettlementStatus.CANCELLED) },
     });
     if (dup) {
       skipped += 1;
