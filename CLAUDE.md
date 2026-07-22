@@ -16,6 +16,7 @@ npm run job <key>    # 잡 수동 단건 실행 (DB 연결 → 1회 실행 → �
 npm run job rolling         # 반복 스케줄 롤링
 npm run job settlement      # 정산 자동 생성
 npm run job holiday         # 공휴일 동기화
+npm run job session-complete # 수업 종료 세션 완료 처리
 npm run job billing         # 구독 정기결제 (스케줄러에서는 비활성)
 npm run job billing-retry   # 구독 결제 재시도 (스케줄러에서는 비활성)
 ```
@@ -60,6 +61,7 @@ index.ts → AppDataSource.initialize() → scheduler/index.ts:startScheduler()
 | `rolling-schedule` | `0 3 * * *` (매일 03:00) | 2 | 반복 시간표 → ClassSchedule 선행 생성 (`ROLLING_HORIZON_DAYS`일치) |
 | `auto-settlement` | `0 4 1 * *` (매월 1일 04:00) | 2 | 전월 완료 세션 집계 → Settlement 생성 (멱등) |
 | `holiday` | `0 2 1 * *` (매월 1일 02:00) | 3 | 공공데이터포털 특일정보 → Holiday upsert (`HOLIDAY_HORIZON_MONTHS`개월치) |
+| `session-complete` | `*/10 * * * *` (10분마다) | 1 | 수업 종료 처리 — ① `OPEN`→`STARTED`(시작시각 경과) ② 컷오프(종료시각, 미체크인 BOOKED 있으면 +1h 유예) 경과 수업 → `COMPLETED` + 세션 체크인→`COMPLETED`/미체크인→`NO_SHOW`. `HOLD`(PARTNER/ADMIN 세팅)는 skip. 설계: `docs/session-finalize-design.md` |
 | `subscription-billing` | `0 21 * * *` | 0 | 구독 정기결제 — **스케줄러에서 주석 처리(비활성)** |
 | `subscription-billing-retry` | `0 20 * * *` | 0 | 전일 실패(PAST_DUE) 재시도 — **비활성** |
 

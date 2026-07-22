@@ -46,6 +46,7 @@ export const config = {
     systemHealthCheck: { cron: process.env.JOB_HEALTH_CHECK ?? '* * * * *' },
     holiday: { cron: process.env.JOB_HOLIDAY_CRON ?? '0 2 1 * *' }, // 매월 1일 02:00
     memberPurge: { cron: process.env.JOB_MEMBER_PURGE_CRON ?? '0 5 * * *' }, // 매일 05:00
+    sessionComplete: { cron: process.env.JOB_SESSION_COMPLETE_CRON ?? '*/10 * * * *' }, // 10분마다
   },
   params: {
     rollingHorizonDays: num(process.env.ROLLING_HORIZON_DAYS, 30),

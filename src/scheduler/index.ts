@@ -8,6 +8,7 @@ import * as settlement from '../jobs/auto-settlement.job';
 import * as healthCheck from '../jobs/health-check.job';
 import * as holiday from '../jobs/holiday.job';
 import * as memberPurge from '../jobs/member-purge.job';
+import * as sessionComplete from '../jobs/session-complete.job';
 
 const jobs: schedule.Job[] = [];
 
@@ -67,6 +68,14 @@ export function startScheduler(): void {
     cron: config.jobs.memberPurge.cron,
     retries: 1,
     execute: memberPurge.execute,
+  });
+
+  // 수업 종료 처리 — 10분마다 (종료 시각 지난 BOOKED 세션 → COMPLETED)
+  registerJob(jobs, {
+    name: sessionComplete.JOB_NAME,
+    cron: config.jobs.sessionComplete.cron,
+    retries: 1,
+    execute: sessionComplete.execute,
   });
 
   logger.info(`등록된 잡: ${jobs.length}개`);

@@ -16,6 +16,14 @@ export const SessionStatus = {
   NO_SHOW: 'NO_SHOW',
 } as const;
 
+/** studio_class_schedule.status (수업 상태머신: OPEN → STARTED → COMPLETED, HOLD는 PARTNER/ADMIN 세팅) */
+export const ScheduleStatus = {
+  OPEN: 'OPEN',
+  STARTED: 'STARTED',
+  HOLD: 'HOLD',
+  COMPLETED: 'COMPLETED',
+} as const;
+
 /** settlement.status */
 export const SettlementStatus = {
   PENDING: 'PENDING',
