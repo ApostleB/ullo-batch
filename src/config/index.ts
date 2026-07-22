@@ -23,11 +23,14 @@ export const config = {
     baseUrl: 'https://api.tosspayments.com',
   },
   inicis: {
-    // KG이니시스 빌링(자동결제) — 빌링 MID + INIAPI 2.0 빌링 key (ullo inipay.client.ts와 동일 자격증명)
+    // 빌링(구독) MID 의 자격 — 일반결제(INICIS_MID/INIAPI_KEY)와 다르다 (테스트: INIBillTst)
     billMid: process.env.INICIS_BILL_MID ?? '',
     iniapiBillKey: process.env.INIAPI_BILL_KEY ?? '',
-    siteUrl: process.env.INICIS_SITE_URL ?? 'https://ullo.co.kr',
-    billingApiUrl: 'https://iniapi.inicis.com/v2/pg/billing',
+    siteUrl: process.env.INICIS_SITE_URL || 'https://ullo.co.kr',
+  },
+  billing: {
+    // member_billing.billing_key 복호화 키 — 백엔드 BILLING_KEY_ENC_KEY 와 동일해야 한다
+    encKey: process.env.BILLING_KEY_ENC_KEY ?? '',
   },
   openApi: {
     // 공공데이터포털 서비스키 (디코딩된 값)

@@ -8,15 +8,17 @@ import { MemberCredit } from '../entities/member-credit.entity';
 import { MemberCreditLog } from '../entities/member-credit-log.entity';
 import { ActiveStatus, IsYn, PaymentStatus, PlanStatus } from '../entities/enums';
 import { chargeBilling } from '../utils/toss-billing.client';
-import { chargeInicisBilling } from '../utils/inicis-billing.client';
+import { chargeInipayBilling } from '../utils/inipay-billing.client';
+import { decryptBillingKey, isEncryptedBillingKey } from '../utils/billing-crypto.util';
 import { addMonthsClamped, today, ymd } from '../utils/date.util';
+import { config } from '../config';
 import { createJobLogger } from '../logger';
 
 export const PRIMARY_JOB_NAME = 'subscription-billing';
 export const RETRY_JOB_NAME = 'subscription-billing-retry';
 
-/** 크레딧 유효기간(개월) — 구독 1회 결제로 적립되는 크레딧 */
-const CREDIT_VALID_MONTHS = 1;
+/** 크레딧 유효기간(개월) — 결제일로부터 3개월 (백엔드 단건·구독 적립과 공통 정책) */
+const CREDIT_VALID_MONTHS = 3;
 
 type Log = ReturnType<typeof createJobLogger>;
 
@@ -99,7 +101,7 @@ async function processOne(
 
   if (!billing || billing.is_active !== ActiveStatus.Y || !pl || (pl.actual_amount ?? 0) <= 0) {
     log.warn(`결제 불가(빌링/플랜 없음) plan=${plan.member_plan_id} → ${onFailStatus}`);
-    await markFailed(plan, onFailStatus, orderId, null, 'NO_BILLING_OR_PLAN', '빌링키 또는 플랜이 유효하지 않음');
+    await markFailed(plan, onFailStatus, orderId, null, 'NO_BILLING_OR_PLAN', '빌링키 또는 플랜이 유효하지 않음', 'inicis');
     return 'failed';
   }
 
@@ -114,15 +116,35 @@ async function processOne(
   const amount = pl.actual_amount!;
   const grant = pl.credit ?? 0;
   const orderName = pl.plan_title ?? '구독 결제';
+  const isInicis = (billing.provider ?? '').toUpperCase() === 'INICIS';
 
   // 3) 자동결제 (트랜잭션 밖) — 빌링키의 PG(provider)에 따라 토스/이니시스 분기.
   //    provider NULL 또는 'TOSS' = 레거시 토스 빌링키(이니시스 마이그레이션 이전 발급분).
-  const provider = (billing.provider ?? 'TOSS').toUpperCase();
   let charge: ChargeResult;
   try {
-    if (provider === 'INICIS') {
-      const r = await chargeInicisBilling({ billKey: billing.billing_key, amount, orderId, orderName });
-      charge = { pgProvider: 'inicis', paymentKey: r.tid, method: r.method, transactionId: r.tid };
+    if (isInicis) {
+      // 백엔드가 billing_key 를 AES-256-GCM(enc:v1:) 으로 저장 — 복호화 후 과금
+      if (isEncryptedBillingKey(billing.billing_key) && !config.billing.encKey) {
+        throw Object.assign(new Error('BILLING_KEY_ENC_KEY 가 설정되지 않아 빌링키를 복호화할 수 없습니다.'), {
+          code: 'NO_BILLING_ENC_KEY',
+        });
+      }
+      const billKey = decryptBillingKey(billing.billing_key, config.billing.encKey);
+      // buyer 3종은 INIAPI 필수(빈값 → ER0102) — 회원 정보를 실어 보낸다
+      const [buyer] = (await AppDataSource.query(
+        `SELECT member_nickname, member_name, member_email, member_mobile FROM member WHERE member_id = $1`,
+        [plan.member_id],
+      )) as Array<{ member_nickname: string | null; member_name: string | null; member_email: string | null; member_mobile: string | null }>;
+      const res = await chargeInipayBilling({
+        billKey,
+        orderId,
+        amount,
+        goodName: orderName,
+        buyerName: buyer?.member_nickname ?? buyer?.member_name ?? undefined,
+        buyerEmail: buyer?.member_email ?? undefined,
+        buyerTel: buyer?.member_mobile?.replace(/-/g, '') ?? undefined,
+      });
+      charge = { pgProvider: 'inicis', paymentKey: res.tid, method: 'card', transactionId: res.tid };
     } else {
       const r = await chargeBilling({
         billingKey: billing.billing_key,
@@ -140,8 +162,9 @@ async function processOne(
     }
   } catch (err) {
     const e = err as { code?: string; message?: string };
+    const provider = isInicis ? 'inicis' : 'toss';
     log.warn(`결제 실패 plan=${plan.member_plan_id} provider=${provider} [${e.code}] ${e.message} → ${onFailStatus}`);
-    await markFailed(plan, onFailStatus, orderId, amount, e.code ?? null, e.message ?? null);
+    await markFailed(plan, onFailStatus, orderId, amount, e.code ?? null, e.message ?? null, provider);
     return 'failed';
   }
 
@@ -233,6 +256,7 @@ async function markFailed(
   amount: number | null,
   failCode: string | null,
   failReason: string | null,
+  pgProvider: string = 'inicis',
 ): Promise<void> {
   await AppDataSource.transaction(async (m: EntityManager) => {
     const now = new Date();
@@ -247,7 +271,7 @@ async function markFailed(
         status: PaymentStatus.ABORTED,
         order_id: `${orderId}_fail_${now.getTime()}`,
         order_name: '구독 결제 실패',
-        pg_provider: 'toss',
+        pg_provider: pgProvider,
         fail_code: failCode,
         fail_reason: failReason,
         requested_at: now,
