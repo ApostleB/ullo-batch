@@ -14,8 +14,19 @@ import {
 /**
  * 배치의 날짜 유틸은 정산 기간·스케줄 생성일·구독 청구일을 결정한다.
  * 하루가 밀리면 정산이 한 달 경계에서 새거나 스케줄이 하루 비므로 회귀를 반드시 잡아야 한다.
+ *
+ * ⚠️ 이 스펙은 **로컬 타임존이 KST 임을 전제로 한다.** 운영 서버가 KST 이고,
+ *    잡으려는 버그 자체가 "UTC 자정 파싱 → KST 에서 하루 밀림"이기 때문이다.
+ *    그래서 `npm test` 가 `TZ=Asia/Seoul` 을 박아 실행한다(package.json).
+ *    TZ 를 지정하지 않으면 UTC 러너(GitHub Actions)에서 UTC 자정 = 로컬 자정이 되어
+ *    "달라야 한다" 케이스가 거짓 실패한다 — 실제로 CI 에서 한 번 겪었다.
  */
 describe('date.util — 로컬(KST) 경계', () => {
+  it('KST 로 실행되고 있다 (아래 케이스들의 전제)', () => {
+    // getTimezoneOffset 은 UTC 기준 분 단위이고 KST(UTC+9) 는 -540 이다.
+    expect(new Date('2026-09-09T00:00:00Z').getTimezoneOffset()).toBe(-540);
+  });
+
   describe('toLocalDate — UTC 파싱으로 인한 하루 밀림 방지', () => {
     it("'YYYY-MM-DD' 문자열을 로컬 자정으로 읽는다", () => {
       const d = toLocalDate('2026-09-09');

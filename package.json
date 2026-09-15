@@ -6,8 +6,8 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "nodemon --watch src --ext ts --exec ts-node src/index.ts",
-    "test": "jest",
-    "test:watch": "jest --watch",
+    "test": "TZ=Asia/Seoul jest",
+    "test:watch": "TZ=Asia/Seoul jest --watch",
     "build": "tsc",
     "start": "node dist/index.js",
     "job": "ts-node src/cli.ts",
