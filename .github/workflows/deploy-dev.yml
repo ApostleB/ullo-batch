@@ -70,6 +70,27 @@ jobs:
             head -3 /tmp/keyscan.err || true
           fi
 
+      # 경로·프로세스를 먼저 확인한다. 시크릿 값은 로그에서 마스킹되므로,
+      # 여기서 잡지 않으면 "cd: ***: No such file or directory" 만 남아 원인을 알기 어렵다.
+      - name: Check server
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new \
+            -p "${{ secrets.DEV_SSH_PORT || '22' }}" \
+            "${{ secrets.DEV_SSH_USER }}@${{ secrets.DEV_SSH_HOST }}" << 'EOF'
+            set -e
+            if [ ! -d '${{ secrets.DEV_DEPLOY_PATH }}/.git' ]; then
+              echo "::error::DEV_DEPLOY_PATH 가 서버에 없거나 git 저장소가 아니다."
+              echo "::error::배치는 docroot 가 아니라 **저장소 경로**를 넣어야 한다 (예: /home/rocky/ullo-batch)."
+              exit 1
+            fi
+            command -v pm2 >/dev/null || { echo "::error::서버에 pm2 가 없다"; exit 1; }
+            pm2 describe ullo-batch >/dev/null 2>&1 || {
+              echo "::error::pm2 에 ullo-batch 프로세스가 없다. 최초 1회는 서버에서 직접 기동할 것 — npm run deploy:prod (또는 deploy:local)"
+              exit 1
+            }
+            echo "서버 점검 통과"
+          EOF
+
       - name: Deploy over SSH
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new \
