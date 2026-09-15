@@ -1,0 +1,136 @@
+name: Deploy batch (dev)
+
+# dev 브랜치 push → CI 에서 빌드·테스트 → 서버에서 pull·빌드 → pm2 reload
+#  - 배치는 정적 파일이 아니라 상주 프로세스라 **서버에서 빌드**한다(API 와 같은 방식).
+#  - **pm2 인스턴스는 반드시 1개다**(ecosystem.config.js). 클러스터로 뜨면 정산·결제가 중복 실행된다.
+#    그래서 이미 떠 있는 프로세스를 reload 만 하고, 없으면 실패시킨다(최초 기동은 사람이 한다).
+#  - main(운영) 을 붙일 때는 이 파일을 복제해 트리거·environment·시크릿만 PROD_* 로 바꾼다.
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch: {}
+
+# 배포 도중 취소되면 pm2 reload 가 중간에 끊긴다 → 진행 중인 실행은 취소하지 않는다
+concurrency:
+  group: deploy-batch-dev
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    # 시크릿이 저장소가 아니라 Environment 에 있다. 이 줄이 없으면 secrets.DEV_* 가 전부 빈 값이다.
+    environment: DEV_ULLO_BATCH
+    steps:
+      # 시크릿 이름이 어긋나면 빈 값으로 들어와 엉뚱한 경로에서 git reset 이 돈다. 먼저 막는다.
+      - name: Check secrets
+        env:
+          SSH_HOST: ${{ secrets.DEV_SSH_HOST }}
+          SSH_USER: ${{ secrets.DEV_SSH_USER }}
+          SSH_KEY: ${{ secrets.DEV_SSH_KEY }}
+          REPO_PATH: ${{ secrets.DEV_DEPLOY_PATH }}
+        run: |
+          fail=0
+          [ -n "$SSH_HOST" ]  || { echo "::error::DEV_SSH_HOST 가 비어 있습니다"; fail=1; }
+          [ -n "$SSH_USER" ]  || { echo "::error::DEV_SSH_USER 가 비어 있습니다"; fail=1; }
+          [ -n "$SSH_KEY" ]   || { echo "::error::DEV_SSH_KEY 가 비어 있습니다"; fail=1; }
+          [ -n "$REPO_PATH" ] || { echo "::error::DEV_DEPLOY_PATH(서버 저장소 경로) 가 비어 있습니다"; fail=1; }
+          case "$REPO_PATH" in
+            /|/home|/root|/etc|/var|/usr) echo "::error::DEV_DEPLOY_PATH 가 위험한 경로입니다: $REPO_PATH"; fail=1 ;;
+          esac
+          exit $fail
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      # 배치는 빌드가 곧 타입체크다(tsc). 실패하면 서버를 건드리지 않는다.
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Setup SSH
+        env:
+          SSH_KEY: ${{ secrets.DEV_SSH_KEY }}
+          SSH_HOST: ${{ secrets.DEV_SSH_HOST }}
+          SSH_PORT: ${{ secrets.DEV_SSH_PORT }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          if ! ssh-keyscan -p "${SSH_PORT:-22}" -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/tmp/keyscan.err; then
+            echo "::warning::ssh-keyscan 실패 — 아래 오류 참고"
+            head -3 /tmp/keyscan.err || true
+          fi
+
+      - name: Deploy over SSH
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new \
+            -p "${{ secrets.DEV_SSH_PORT || '22' }}" \
+            "${{ secrets.DEV_SSH_USER }}@${{ secrets.DEV_SSH_HOST }}" << 'EOF'
+            set -e
+            cd '${{ secrets.DEV_DEPLOY_PATH }}'
+
+            echo "📦 [1/5] 최신 코드 가져오기..."
+            # 배포 서버는 배포 커밋의 정확한 사본이어야 한다.
+            # reset --hard 는 추적 파일만 되돌린다 — .env, logs/ 같은 untracked 자산은 보존된다.
+            # (git clean 은 .env 를 지우므로 절대 추가하지 말 것)
+            git fetch origin '${{ github.ref_name }}'
+            git reset --hard '${{ github.sha }}'
+
+            echo "📚 [2/5] 의존성 설치..."
+            npm ci
+
+            echo "🔨 [3/5] 빌드..."
+            npm run build
+
+            echo "🏷  [4/5] 배포 표식 기록 — 기동 로그와 배포 검증이 이 파일을 본다"
+            printf '{\n  "commit": "%s",\n  "ref": "%s",\n  "run_id": "%s",\n  "built_at": "%s"\n}\n' \
+              "${{ github.sha }}" "${{ github.ref_name }}" "${{ github.run_id }}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > build-info.json
+            cat build-info.json
+
+            echo "🚀 [5/5] pm2 재시작..."
+            # 이미 떠 있는 프로세스만 reload 한다. 새로 start 하면 --env 를 추측해야 하고,
+            # 잘못 고르면 NODE_ENV 가 바뀌어 DB·PG 설정이 통째로 달라진다.
+            if pm2 describe ullo-batch > /dev/null 2>&1; then
+              pm2 reload ullo-batch --update-env
+            else
+              echo "::error::pm2 에 ullo-batch 프로세스가 없다. 최초 1회는 서버에서 직접 기동할 것 — npm run deploy:prod (또는 deploy:local)"
+              exit 1
+            fi
+
+            echo "✅ 배포 완료!"
+          EOF
+
+      # 서버가 이번 커밋으로 돌고 있는지 확인한다. 여기까지 통과해야 배포 성공이다.
+      - name: Verify deployment
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new \
+            -p "${{ secrets.DEV_SSH_PORT || '22' }}" \
+            "${{ secrets.DEV_SSH_USER }}@${{ secrets.DEV_SSH_HOST }}" << 'EOF'
+            set -e
+            cd '${{ secrets.DEV_DEPLOY_PATH }}'
+
+            served=$(tr -d ' "' < build-info.json | grep -oE 'commit:[0-9a-f]+' | cut -d: -f2)
+            if [ "$served" != '${{ github.sha }}' ]; then
+              echo "::error::서버 build-info 커밋이 이번 실행과 다르다 — 서버: ${served:-(없음)}"
+              exit 1
+            fi
+
+            # pm2 가 살아 있는지 — reload 직후 크래시하면 pid 가 비거나 0 이다.
+            sleep 3
+            pid=$(pm2 pid ullo-batch | tr -d '[:space:]')
+            if [ -z "$pid" ] || [ "$pid" = "0" ]; then
+              echo "::error::pm2 프로세스가 떠 있지 않다. 기동 실패 로그를 확인할 것: pm2 logs ullo-batch --err"
+              exit 1
+            fi
+
+            echo "✅ 배치 커밋 ${served} / pm2 pid ${pid}"
+          EOF

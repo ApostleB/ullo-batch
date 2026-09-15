@@ -6,3 +6,6 @@ logs/
 .DS_Store
 .idea/
 .env*
+
+# 배포 스크립트가 서버에 남기는 표식 (기동 로그·배포 검증이 읽는다)
+build-info.json
