@@ -112,7 +112,16 @@ async function processOne(
 
   if (!billing || billing.is_active !== ActiveStatus.Y || !pl || amount <= 0) {
     log.warn(`결제 불가(빌링/플랜 없음) plan=${plan.member_plan_id} → ${onFailStatus}`);
-    await markFailed(plan, onFailStatus, orderId, null, 'NO_BILLING_OR_PLAN', '빌링키 또는 플랜이 유효하지 않음');
+    // 이 시점엔 청구를 시도조차 못 했다 — 빌링키의 provider 태그를 그대로 기록한다(없으면 레거시 토스).
+    await markFailed(
+      plan,
+      onFailStatus,
+      orderId,
+      null,
+      'NO_BILLING_OR_PLAN',
+      '빌링키 또는 플랜이 유효하지 않음',
+      (billing?.provider ?? 'TOSS').toUpperCase() === 'INICIS' ? 'inicis' : 'toss',
+    );
     return 'failed';
   }
 
@@ -152,7 +161,15 @@ async function processOne(
   } catch (err) {
     const e = err as { code?: string; message?: string };
     log.warn(`결제 실패 plan=${plan.member_plan_id} provider=${provider} [${e.code}] ${e.message} → ${onFailStatus}`);
-    await markFailed(plan, onFailStatus, orderId, amount, e.code ?? null, e.message ?? null);
+    await markFailed(
+      plan,
+      onFailStatus,
+      orderId,
+      amount,
+      e.code ?? null,
+      e.message ?? null,
+      provider === 'INICIS' ? 'inicis' : 'toss',
+    );
     return 'failed';
   }
 
@@ -249,6 +266,8 @@ async function markFailed(
   amount: number | null,
   failCode: string | null,
   failReason: string | null,
+  /** 실제 청구를 시도한 PG — 성공 기록(charge.pgProvider)과 같은 소문자 표기를 쓴다. */
+  pgProvider: string,
 ): Promise<void> {
   await AppDataSource.transaction(async (m: EntityManager) => {
     const now = new Date();
@@ -263,7 +282,7 @@ async function markFailed(
         status: PaymentStatus.ABORTED,
         order_id: `${orderId}_fail_${now.getTime()}`,
         order_name: '구독 결제 실패',
-        pg_provider: 'toss',
+        pg_provider: pgProvider,
         fail_code: failCode,
         fail_reason: failReason,
         requested_at: now,
