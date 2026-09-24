@@ -23,7 +23,11 @@ export function startScheduler(): void {
     execute: healthCheck.executeHealthCheck
   })
 
-  //토스 결제 미사용으로 다음 정책이 나올떄까지 비활성화
+  // ── 구독 정기결제(subscription-billing) — 미사용으로 잡 등록 비활성화 ──
+  // 정기구독 기능을 쓰지 않기로 해서 스케줄 등록하지 않는다(자동 청구 없음).
+  // 이니시스 전환 코드(subscription-billing.job / inipay-billing.client)는 그대로 두어
+  // 정책이 정해지면 아래 주석만 해제하면 되도록 한다. CLI 수동 실행은 여전히 가능:
+  //   npm run job billing / npm run job billing-retry
   // 구독 정기결제 — 매일 21:00 (재시도는 매일 20:00). 잡 내부에서 건별 처리하므로 p-retry는 0.
   // registerJob(jobs, {
   //   name: billing.PRIMARY_JOB_NAME,
