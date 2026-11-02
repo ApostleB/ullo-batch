@@ -24,6 +24,13 @@ describe('parseTestOptions — 재현 테스트 전용 CLI 옵션', () => {
     expect(parseTestOptions('billing', ['--as-of', '2026-12-03', '--member', 'm1'], env)).toEqual({ asOf: '2026-12-03', memberId: 'm1' });
   });
 
+  it('크레딧 만료 안내 잡(credit-expiry-notice)도 같은 안전장치 아래에서 --as-of/--member 를 허용한다', () => {
+    expect(parseTestOptions('credit-expiry-notice', ['--as-of', '2026-12-03', '--member', 'm1'], LOCAL)).toEqual({ asOf: '2026-12-03', memberId: 'm1' });
+    expect(() => parseTestOptions('credit-expiry-notice', ['--as-of', '2026-12-03'], { ...LOCAL, NODE_ENV: 'production' })).toThrow(/비운영/);
+    expect(() => parseTestOptions('credit-expiry-notice', ['--as-of', '2026-12-03'], { ...LOCAL, BILLING_TEST_DB_CONFIRM: undefined })).toThrow(/BILLING_TEST_DB_CONFIRM/);
+    expect(() => parseTestOptions('credit-expiry-notice', ['--bogus', 'x'], LOCAL)).toThrow(/알 수 없는 옵션/);
+  });
+
   it('--as-of=값 형식도 읽고 billing-retry 도 허용한다', () => {
     expect(parseTestOptions('billing-retry', ['--as-of=2026-12-03'], LOCAL)).toEqual({ asOf: '2026-12-03' });
   });

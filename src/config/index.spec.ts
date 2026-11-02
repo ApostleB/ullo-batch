@@ -44,3 +44,31 @@ describe('config.danal', () => {
     expect(c.apiBaseUrl).toBe('https://one-api.danalpay.com');
   });
 });
+
+/** config.creditExpiry — 크레딧 만료 사전 안내 게이트는 정확히 'true' 일 때만 켜진다(기본 꺼짐) */
+describe('config.creditExpiry', () => {
+  const saved = process.env.CREDIT_EXPIRY_NOTICE_ENABLED;
+  afterEach(() => {
+    if (saved === undefined) delete process.env.CREDIT_EXPIRY_NOTICE_ENABLED;
+    else process.env.CREDIT_EXPIRY_NOTICE_ENABLED = saved;
+  });
+  const load = () => {
+    let cfg: typeof import('./index').config | undefined;
+    jest.isolateModules(() => {
+      cfg = require('./index').config;
+    });
+    return cfg!;
+  };
+
+  it.each([
+    [undefined, false],
+    ['', false],
+    ['TRUE', false],
+    ['1', false],
+    ['true', true],
+  ])('CREDIT_EXPIRY_NOTICE_ENABLED=%s → %s', (value, expected) => {
+    if (value === undefined) delete process.env.CREDIT_EXPIRY_NOTICE_ENABLED;
+    else process.env.CREDIT_EXPIRY_NOTICE_ENABLED = value;
+    expect(load().creditExpiry.noticeEnabled).toBe(expected);
+  });
+});

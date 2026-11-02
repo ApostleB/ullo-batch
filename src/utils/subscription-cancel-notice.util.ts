@@ -58,8 +58,38 @@ export function buildSubscriptionCancelMessage(reason: SubscriptionCancelReasonT
 }
 
 /**
- * 해지 알림을 기록한다. 호출자의 해지 트랜잭션 안에서 부르면 `manager.transaction`(SAVEPOINT)으로 감싸 알림 insert 실패가
- * 해지·결제 트랜잭션을 abort 시키지 않게 하고, 해지가 롤백되면 알림도 함께 사라진다. 실패는 로그만 남기고 삼킨다.
+ * 카카오 알림톡 스텁 기록 — 해지·크레딧 만료 안내 공용. `manager.transaction`(SAVEPOINT)으로 감싸 insert 실패가 호출자의 트랜잭션을
+ * abort 시키지 않게 하고, 호출자 트랜잭션이 롤백되면 함께 사라진다. 실패는 로그만 남기고 false 를 돌려준다(throw 하지 않는다).
+ * @returns 기록했으면 true, 실패했으면 false
+ */
+export async function recordKakaoStubNotice(
+  manager: EntityManager,
+  input: { memberId: string; title: string; body: string; link: string },
+  log: { error: (message: string, meta?: unknown) => unknown },
+): Promise<boolean> {
+  try {
+    await manager.transaction(async (tx) => {
+      await tx.insert(MemberNotification, {
+        member_id: input.memberId,
+        category: KAKAO_STUB_CATEGORY,
+        title: input.title,
+        body: input.body,
+        link: input.link,
+        studio_id: null,
+        is_read: IsYn.N,
+        is_del: IsYn.N,
+      });
+    });
+    return true;
+  } catch (err) {
+    log.error(`[NOTIFY_FAILED] 알림 기록 실패(본 처리에는 영향 없음) link=${input.link}: ${(err as Error).message}`);
+    return false;
+  }
+}
+
+/**
+ * 해지 알림을 기록한다. 호출자의 해지 트랜잭션 안에서 부르면 SAVEPOINT 로 알림 insert 실패가 해지·결제 트랜잭션을 abort 시키지 않게 하고,
+ * 해지가 롤백되면 알림도 함께 사라진다. 실패는 로그만 남기고 삼킨다.
  */
 export async function recordSubscriptionCancelNotice(
   manager: EntityManager,
@@ -67,22 +97,13 @@ export async function recordSubscriptionCancelNotice(
   log: { error: (message: string, meta?: unknown) => unknown },
 ): Promise<void> {
   const message = buildSubscriptionCancelMessage(input.reason);
-  try {
-    await manager.transaction(async (tx) => {
-      await tx.insert(MemberNotification, {
-        member_id: input.memberId,
-        category: KAKAO_STUB_CATEGORY,
-        title: message.title,
-        body: message.body,
-        link: `subscription/${input.memberPlanId}?reason=${input.reason}`,
-        studio_id: null,
-        is_read: IsYn.N,
-        is_del: IsYn.N,
-      });
-    });
-  } catch (err) {
-    log.error(
-      `[NOTIFY_FAILED] 구독 해지 알림 기록 실패(해지·결제에는 영향 없음) plan=${input.memberPlanId} reason=${input.reason}: ${(err as Error).message}`,
-    );
+  const ok = await recordKakaoStubNotice(
+    manager,
+    { memberId: input.memberId, title: message.title, body: message.body, link: `subscription/${input.memberPlanId}?reason=${input.reason}` },
+    log,
+  );
+  // 해지 알림 실패 로그는 기존 형식(plan·reason 포함)을 유지한다
+  if (!ok) {
+    log.error(`[NOTIFY_FAILED] 구독 해지 알림 기록 실패(해지·결제에는 영향 없음) plan=${input.memberPlanId} reason=${input.reason}`);
   }
 }

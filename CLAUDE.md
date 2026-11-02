@@ -20,6 +20,7 @@ npm run job holiday         # 공휴일 동기화
 npm run job session-complete # 수업 종료 세션 완료 처리
 npm run job billing         # 구독 정기결제 (스케줄러에서는 비활성)
 npm run job billing-retry   # 구독 결제 재시도 (스케줄러에서는 비활성)
+npm run job credit-expiry-notice  # 해지된 구독 크레딧 만료 15일 전 사전 안내 (스케줄러에서는 비활성)
 ```
 
 **PM2 배포:**
@@ -65,8 +66,9 @@ index.ts → AppDataSource.initialize() → scheduler/index.ts:startScheduler()
 | `session-complete` | `*/10 * * * *` (10분마다) | 1 | 수업 종료 처리 — ① `OPEN`→`STARTED`(시작시각 경과) ② 컷오프(종료시각, 미체크인 BOOKED 있으면 +1h 유예) 경과 수업 → `COMPLETED` + 세션 체크인→`COMPLETED`/미체크인→`NO_SHOW`. `HOLD`(PARTNER/ADMIN 세팅)는 skip. 설계: `docs/session-finalize-design.md` |
 | `subscription-billing` | `0 21 * * *` | 0 | 구독 정기결제 — **스케줄러에서 주석 처리(비활성)** |
 | `subscription-billing-retry` | `0 20 * * *` | 0 | 전일 실패(PAST_DUE) **1회** 재시도, 재시도도 실패하면 구독 해지 — **비활성** |
+| `credit-expiry-notice` | `0 10 * * *` (매일 10:00) | 0 | 해지된 구독에서 지급된 크레딧의 만료 15일 전 사전 안내(카카오 스텁 기록) — **비활성**, 게이트 `CREDIT_EXPIRY_NOTICE_ENABLED` |
 
-billing 2종은 `scheduler/index.ts`에서 주석 처리되어 있으나 CLI(`npm run job billing`)로는 여전히 수동 실행 가능. 결제 잡은 건별로 try/catch·멱등 처리를 하므로 p-retry는 0.
+billing 2종과 `credit-expiry-notice`는 `scheduler/index.ts`에서 주석 처리되어 있으나 CLI(`npm run job billing`)로는 여전히 수동 실행 가능. 결제 잡은 건별로 try/catch·멱등 처리를 하므로 p-retry는 0.
 
 ### 새 잡 추가 방법
 
@@ -100,6 +102,17 @@ billing 2종은 `scheduler/index.ts`에서 주석 처리되어 있으나 CLI(`np
 - **재현 테스트 옵션 `--as-of`/`--member` (N-8):** `billing`·`billing-retry` 잡에서만 허용하고, 알 수 없는 옵션·위치 인자는 거부한다. 그리고 `NODE_ENV` 가 명시적 비운영 값(`local`·`development`·`dev`·`test`)이고 `DANAL_API_BASE_URL` 이 localhost/127.0.0.1 이며 `BILLING_TEST_DB_CONFIRM=<DB_HOST>/<DB_NAME>`(이 프로세스가 연결할 DB)을 직접 적었을 때만 동작한다. 예: `NODE_ENV=local BILLING_TEST_DB_CONFIRM=127.0.0.1/ullo_test DANAL_API_BASE_URL=http://localhost:3999 npm run job billing -- --as-of 2027-03-02 --member <id>`.
 - **운영 판단(N-9):** `NODE_ENV` 가 명시적 비운영 값이 아니면(미주입·오타·staging 포함) 운영으로 본다 — 게이트가 켜진 상태에서 `SK_TEST_` 키면 청구 전에 중단한다(`config.nodeEnv` = 원본 `NODE_ENV`, `config.env` 는 미주입 시 `local` 이라 쓰지 않는다). 개발 PC 는 `.env` 에 `NODE_ENV=local` 을 둔다.
 
+### 크레딧 만료 사전 안내 — `jobs/credit-expiry-notice.job.ts`
+
+정책(2026-11-03 확정): 구독을 해지해도 이미 지급된 크레딧은 **유효기간까지 유지**된다("해지 후 15일 소멸"은 쓰지 않는다). 크레딧이 만료되기 **15일 전에 사전 안내만** 보낸다.
+
+- **운영 게이트:** `CREDIT_EXPIRY_NOTICE_ENABLED` 가 정확히 `'true'` 일 때만 DB 를 조회·기록한다(기본 꺼짐, CLI 수동 실행도 같다). 스케줄러 등록은 billing 잡처럼 주석 처리 상태다(정책 확인 후 주석 해제). cron 은 `JOB_CREDIT_EXPIRY_NOTICE_CRON`(기본 매일 10:00).
+- **대상 식별:** `member_credit` 중 `credit_type='SUBSCRIPTION'`(구독 지급분 — 쿠폰 `COUPON`·일회성 `PLAIN` 제외) 이고 `member_membership_id`(= `member_plan_id`) 의 구독이 `status='CANCELED'`·`is_del='N'`, 회원 미탈퇴, lot `is_del='N'`·잔여 `credit > 0`, 만료일 `end_dt` 가 **[오늘 + 1일, 오늘 + 15일]** 인 lot 을 **회원·만료일 묶음으로 잔여를 합산**한 것. 날짜는 KST 로컬 날짜이고 `to_char(end_dt,'YYYY-MM-DD')` 문자열로 다룬다.
+- **멱등 키(스키마 변경 없음):** `member_notification` 의 `member_id` + `category='KAKAO_STUB'` + `link='credit-expiry?end_dt=YYYY-MM-DD'`. 묶음마다 `pg_advisory_xact_lock(hashtext('creditexp:{회원}:{만료일}'))` 아래에서 존재 확인 후 기록해 하루 두 번·동시 실행에도 1회다. 같은 만료일 묶음의 잔여가 나중에 바뀌어도 다시 보내지 않는다.
+- **지나친 D-15:** 윈도가 15일 폭이라 배치가 못 돈 날 D-15 를 지나쳐도 D-14 ~ D-1 사이에서 아직 안내하지 않은 묶음을 1회 보낸다. 구독을 해지한 시점에 이미 만료가 임박했어도 다음 실행에서 1회 안내한다. 만료일 당일 이후는 보내지 않는다.
+- **발송:** 해지 알림과 같은 스텁 기록(`recordKakaoStubNotice` — `manager.transaction` SAVEPOINT 로 실패 격리, 실패 시 `[NOTIFY_FAILED]` 로그 + 기록 없음이라 다음 실행에서 재시도). 카카오 호출·실제 발송은 없고 앱 알림 목록에는 보이지 않는다(category=`KAKAO_STUB`). 문구(`utils/credit-expiry-notice.util.ts`)는 남은 크레딧 수·만료일·남은 일수만 넣고 금액·키 등 민감값은 넣지 않는다.
+- **재현 옵션:** `--as-of YYYY-MM-DD`/`--member <id>` 를 billing 잡과 같은 안전장치(N-8: 비운영 `NODE_ENV`·로컬 `DANAL_API_BASE_URL`·`BILLING_TEST_DB_CONFIRM`)로 허용한다. 예: `NODE_ENV=local BILLING_TEST_DB_CONFIRM=127.0.0.1/ullo_test DANAL_API_BASE_URL=http://localhost:3999 npm run job credit-expiry-notice -- --as-of 2026-11-18 --member <id>`.
+
 ### 반드시 알아야 할 공통 규칙
 
 - **date 컬럼 UTC off-by-one**: TypeORM의 `date` 타입은 런타임에 `'YYYY-MM-DD'` 문자열로 온다. `new Date('YYYY-MM-DD')`는 UTC 자정으로 파싱되어 음수 오프셋(KST)에서 하루가 어긋난다. 날짜 비교/포맷 전에 반드시 `toLocalDate()`(문자열/Date 모두 로컬 자정으로 정규화)를 거칠 것. 이 규칙은 rolling-schedule·auto-settlement 전반에 걸쳐 있다.
@@ -117,6 +130,7 @@ billing 2종은 `scheduler/index.ts`에서 주석 처리되어 있으나 CLI(`np
 - `src/utils/holiday-api.client.ts`: 공공데이터포털 `getHoliDeInfo` 호출. 결과 없는 달은 빈 배열로 정규화, `resultCode !== '00'`이면 throw
 - `src/utils/danal-billing.client.ts`: 다날 빌링 승인(`POST /billing/confirm`)·취소(`POST /payments/cancel`). 3분류 에러(`DanalApiError`=확실한 실패 / `DanalResultUnknownError`=결과 불명 / 설정 누락=일반 Error)
 - `src/utils/subscription-fail-reason.util.ts`: 실패 사유 코드·라벨·`classifyPaymentFailure`(백엔드 복제), `BATCH_FAILED` 기록값
+- `src/utils/credit-expiry-notice.util.ts`: 크레딧 만료 안내 문구·멱등 키(link)·`daysBetween`
 - `src/utils/subscription-cancel-notice.util.ts`: 구독 해지 알림 문구·`recordSubscriptionCancelNotice`(KAKAO_STUB 기록, 백엔드 복제)
 - `src/utils/subscription-cycle.util.ts`: 주기 키·시도 번호·`classifyCycle`·다음 결제일 규칙(`nextChargeDateFrom`: 실제 청구일 + 1개월) (백엔드 복제)
 - `src/utils/environment.util.ts`: `isExplicitNonProduction` — 운영 판단 기준(N-9)
@@ -131,6 +145,7 @@ billing 2종은 `scheduler/index.ts`에서 주석 처리되어 있으나 CLI(`np
 | 변수 | 기본값 | 설명 |
 |---|---|---|
 | `NODE_ENV` | (미주입) | 실행 환경. `local`·`development`·`dev`·`test` 만 비운영, 그 외·미주입은 운영으로 본다(테스트 키 방어, 재현 옵션). `config.env` 는 미주입 시 `local` |
+| `CREDIT_EXPIRY_NOTICE_ENABLED` | 꺼짐 | 크레딧 만료 사전 안내 게이트 (정확히 `true` 일 때만 조회·기록) |
 | `BILLING_TEST_DB_CONFIRM` | (없음) | 재현 옵션(`--as-of`/`--member`) 전용: `DB_HOST/DB_NAME` 과 정확히 같아야 한다 |
 | `DB_HOST/PORT/NAME/USERNAME/PASSWORD` | 127.0.0.1 / 5432 / ullo / ullo / '' | PostgreSQL 접속 정보 |
 | `TOSS_SECRET_KEY` | '' | (미사용) 구독 청구 잡이 토스를 호출하지 않는다 |
@@ -140,7 +155,7 @@ billing 2종은 `scheduler/index.ts`에서 주석 처리되어 있으나 CLI(`np
 | `BILLING_KEY_ENC_KEY` | '' | member_billing.billing_key 복호화 키 (백엔드와 동일) |
 | `PUBLIC_DATA_API_KEY` | '' | 공공데이터포털 서비스키(디코딩 값, 공휴일 잡) |
 | `LOG_LEVEL` / `LOG_DIR` | info / logs | 로그 레벨·디렉터리 |
-| `JOB_*_CRON` | config 하드코딩 | 각 잡 cron (`JOB_ROLLING_SCHEDULE_CRON`, `JOB_AUTO_SETTLEMENT_CRON`, `JOB_HOLIDAY_CRON`, `JOB_BILLING_CRON`, `JOB_BILLING_RETRY_CRON`, `JOB_HEALTH_CHECK`) |
+| `JOB_*_CRON` | config 하드코딩 | 각 잡 cron (`JOB_ROLLING_SCHEDULE_CRON`, `JOB_AUTO_SETTLEMENT_CRON`, `JOB_HOLIDAY_CRON`, `JOB_BILLING_CRON`, `JOB_BILLING_RETRY_CRON`, `JOB_CREDIT_EXPIRY_NOTICE_CRON`, `JOB_HEALTH_CHECK`) |
 | `ROLLING_HORIZON_DAYS` | 30 | 스케줄 선행 생성 일수 |
 | `HOLIDAY_HORIZON_MONTHS` | 3 | 공휴일 동기화 대상 개월 수(현재 월 포함) |
 | `SETTLEMENT_DEFAULT_UNIT_PRICE` | 10000 | 정산 기본 단가 (정책 없을 때) |

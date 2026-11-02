@@ -32,6 +32,10 @@ export const config = {
     // 월 자동결제 배치 게이트 — 정확히 'true' 일 때만 청구한다(기본 꺼짐)
     batchEnabled: process.env.DANAL_BILLING_BATCH_ENABLED === 'true',
   },
+  creditExpiry: {
+    // 크레딧 만료 15일 전 사전 안내 게이트 — 정확히 'true' 일 때만 조회·기록한다(기본 꺼짐)
+    noticeEnabled: process.env.CREDIT_EXPIRY_NOTICE_ENABLED === 'true',
+  },
   inicis: {
     // 빌링(구독) MID 의 자격 — 일반결제(INICIS_MID/INIAPI_KEY)와 다르다 (테스트: INIBillTst)
     billMid: process.env.INICIS_BILL_MID ?? '',
@@ -54,6 +58,7 @@ export const config = {
   jobs: {
     billing: { cron: process.env.JOB_BILLING_CRON ?? '0 21 * * *' },
     billingRetry: { cron: process.env.JOB_BILLING_RETRY_CRON ?? '0 20 * * *' },
+    creditExpiryNotice: { cron: process.env.JOB_CREDIT_EXPIRY_NOTICE_CRON ?? '0 10 * * *' }, // 매일 10:00
     rollingSchedule: { cron: process.env.JOB_ROLLING_SCHEDULE_CRON ?? '0 3 * * *' },
     autoSettlement: { cron: process.env.JOB_AUTO_SETTLEMENT_CRON ?? '0 4 1 * *' },
     systemHealthCheck: { cron: process.env.JOB_HEALTH_CHECK ?? '* * * * *' },

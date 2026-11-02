@@ -9,6 +9,7 @@ import * as healthCheck from '../jobs/health-check.job';
 import * as holiday from '../jobs/holiday.job';
 import * as memberPurge from '../jobs/member-purge.job';
 import * as sessionComplete from '../jobs/session-complete.job';
+// import * as creditExpiryNotice from '../jobs/credit-expiry-notice.job';
 
 const jobs: schedule.Job[] = [];
 
@@ -81,6 +82,17 @@ export function startScheduler(): void {
     retries: 1,
     execute: sessionComplete.execute,
   });
+
+  // ── 크레딧 만료 15일 전 사전 안내(credit-expiry-notice) — 스케줄 등록 비활성화(billing 잡과 같은 관례) ──
+  // 운영 게이트(CREDIT_EXPIRY_NOTICE_ENABLED=true)를 켜고 정책 확인 뒤 아래 주석을 해제한다. CLI 수동 실행은 가능:
+  //   npm run job credit-expiry-notice   (재현: -- --as-of YYYY-MM-DD --member <id>, billing 과 같은 안전장치)
+  // 매일 10:00. 잡 내부에서 회원·만료일 묶음 단위로 멱등 처리하므로 p-retry 는 0.
+  // registerJob(jobs, {
+  //   name: creditExpiryNotice.JOB_NAME,
+  //   cron: config.jobs.creditExpiryNotice.cron,
+  //   retries: 0,
+  //   execute: creditExpiryNotice.execute,
+  // });
 
   logger.info(`등록된 잡: ${jobs.length}개`);
 }

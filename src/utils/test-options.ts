@@ -6,7 +6,7 @@ import { parseLocalDate, setAsOfDate } from './date.util';
  * 스케줄러 경로(index.ts)는 이 모듈을 호출하지 않으므로 옵션이 켜질 수 없다.
  *
  * 안전장치 (N-8) — 하나라도 어긋나면 DB 연결 전에 거부한다:
- *  1. billing / billing-retry 잡에서만 허용한다 (다른 잡의 today() 를 바꾸지 못하게).
+ *  1. billing / billing-retry / credit-expiry-notice 잡에서만 허용한다 (다른 잡의 today() 를 바꾸지 못하게).
  *  2. 알 수 없는 옵션·위치 인자는 거부한다 (오타가 조용히 무시되어 전체 회원이 대상이 되지 않게).
  *  3. NODE_ENV 가 명시적 비운영 값(local·development·dev·test)이어야 한다 — 미주입은 운영으로 본다 (N-9 와 같은 기준).
  *  4. DANAL_API_BASE_URL 이 localhost/127.0.0.1 이어야 한다 (실제 다날로 나가지 않게).
@@ -27,7 +27,7 @@ export interface TestOptionsEnv {
 }
 
 /** 재현 옵션을 쓸 수 있는 잡 */
-const TEST_OPTION_JOBS: readonly string[] = ['billing', 'billing-retry'];
+const TEST_OPTION_JOBS: readonly string[] = ['billing', 'billing-retry', 'credit-expiry-notice'];
 const KNOWN_OPTIONS = ['as-of', 'member'] as const;
 /** config.db 의 기본값과 같다 */
 const DEFAULT_DB_HOST = '127.0.0.1';

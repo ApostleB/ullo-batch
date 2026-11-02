@@ -1,6 +1,7 @@
 import {
   SubscriptionCancelReason,
   buildSubscriptionCancelMessage,
+  recordKakaoStubNotice,
   recordSubscriptionCancelNotice,
 } from './subscription-cancel-notice.util';
 
@@ -67,5 +68,18 @@ describe('recordSubscriptionCancelNotice — 실제 발송 없이 member_notific
     const manager = { transaction: jest.fn().mockRejectedValue(new Error('insert failed')) };
     await expect(recordSubscriptionCancelNotice(manager as any, input, log)).resolves.toBeUndefined();
     expect((log.error as jest.Mock).mock.calls[0][0]).toContain('NOTIFY_FAILED');
+  });
+});
+
+describe('recordKakaoStubNotice — 해지·만료 안내 공용 기록(성공 여부를 돌려준다)', () => {
+  const log = { error: jest.fn() };
+  const input = { memberId: 'm1', title: 't', body: 'b', link: 'credit-expiry?end_dt=2026-12-03' };
+
+  it('성공하면 true, 실패하면 false(throw 하지 않음)', async () => {
+    const ok = { transaction: jest.fn(async (cb: any) => cb({ insert: jest.fn() })) };
+    await expect(recordKakaoStubNotice(ok as any, input, log)).resolves.toBe(true);
+    const bad = { transaction: jest.fn().mockRejectedValue(new Error('x')) };
+    await expect(recordKakaoStubNotice(bad as any, input, log)).resolves.toBe(false);
+    expect(log.error.mock.calls[0][0]).toContain('NOTIFY_FAILED');
   });
 });

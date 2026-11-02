@@ -10,6 +10,7 @@ import * as settlement from './jobs/auto-settlement.job';
 import * as holiday from './jobs/holiday.job';
 import * as memberPurge from './jobs/member-purge.job';
 import * as sessionComplete from './jobs/session-complete.job';
+import * as creditExpiryNotice from './jobs/credit-expiry-notice.job';
 
 type Exec = (log: ReturnType<typeof createJobLogger>) => Promise<void>;
 
@@ -21,6 +22,7 @@ const registry: Record<string, { name: string; execute: Exec }> = {
   holiday: { name: holiday.JOB_NAME, execute: holiday.execute },
   'member-purge': { name: memberPurge.JOB_NAME, execute: memberPurge.execute },
   'session-complete': { name: sessionComplete.JOB_NAME, execute: sessionComplete.execute },
+  'credit-expiry-notice': { name: creditExpiryNotice.JOB_NAME, execute: creditExpiryNotice.execute },
 };
 
 async function main(): Promise<void> {
@@ -31,7 +33,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // 재현 테스트 옵션(--as-of/--member) — billing 잡 한정, 알 수 없는 옵션·운영·비로컬 다날 URL·DB 미확인이면 DB 연결 전에 거부한다. 스케줄러(index.ts)는 쓰지 않는다.
+  // 재현 테스트 옵션(--as-of/--member) — billing·billing-retry·credit-expiry-notice 잡 한정, 알 수 없는 옵션·운영·비로컬 다날 URL·DB 미확인이면 DB 연결 전에 거부한다. 스케줄러(index.ts)는 쓰지 않는다.
   try {
     setTestOptions(parseTestOptions(key, process.argv.slice(3), process.env));
   } catch (err) {
