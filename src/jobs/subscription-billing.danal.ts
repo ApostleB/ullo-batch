@@ -1,4 +1,4 @@
-import { EntityManager } from 'typeorm';
+import { EntityManager, IsNull } from 'typeorm';
 import { AppDataSource } from '../db/data-source';
 import { config } from '../config';
 import { MemberPlan } from '../entities/member-plan.entity';
@@ -19,6 +19,8 @@ import {
 } from '../utils/subscription-cycle.util';
 import { addMonthsClamped, formatLocalDateTime, toLocalDate, today, ymd } from '../utils/date.util';
 import { createJobLogger } from '../logger';
+import { FAIL_CODE_BATCH_FAILED } from '../utils/subscription-fail-reason.util';
+import { recordSubscriptionCancelNotice, SubscriptionCancelReason } from '../utils/subscription-cancel-notice.util';
 
 /**
  * 다날 구독 월 자동결제 — 백엔드 SubscriptionChargeService.chargeRecurring + SubscriptionSettleService 와 같은 순서·같은 동작표(T1~T13).
@@ -140,7 +142,13 @@ function failPatch(onFailStatus: OnFailStatus, now: Date): Partial<MemberPlan> {
  * (status 가 NULL 인 구 데이터는 status 조건을 생략하고 is_active=Y·is_del=N 으로만 막는다)
  * @returns 실제로 전이했는지
  */
-async function applyFailTransition(m: EntityManager, snapshot: MemberPlan, onFailStatus: OnFailStatus, now: Date): Promise<boolean> {
+async function applyFailTransition(
+  m: EntityManager,
+  snapshot: MemberPlan,
+  onFailStatus: OnFailStatus,
+  now: Date,
+  log: Log,
+): Promise<boolean> {
   const res = await m.update(
     MemberPlan,
     {
@@ -151,7 +159,16 @@ async function applyFailTransition(m: EntityManager, snapshot: MemberPlan, onFai
     },
     failPatch(onFailStatus, now),
   );
-  return !!res.affected;
+  if (!res.affected) return false;
+  // 재시도 실패 해지(CANCELED)만 알린다 — 1차 실패(PAST_DUE)는 해지가 아니다. 해지 트랜잭션 안의 SAVEPOINT 로 기록한다.
+  if (onFailStatus === PlanStatus.CANCELED) {
+    await recordSubscriptionCancelNotice(
+      m,
+      { memberId: snapshot.member_id, memberPlanId: snapshot.member_plan_id, reason: SubscriptionCancelReason.RETRY_FAILED },
+      log,
+    );
+  }
+  return true;
 }
 
 /** 활성 정지 확인 — 백엔드 MemberSuspensionHelper 와 같은 조건(released_at IS NULL AND (end_at IS NULL OR end_at > 지금)) */
@@ -182,7 +199,7 @@ type Gate =
  * 청구·실패 전이 공통 사전 확인 — 구독 행을 잠그고 (1) 조회 뒤 바뀌었는지 [H-1] (2) 탈퇴 [H-3] (3) 활성 정지(정책2)를 본다.
  * 정지 회원이면 이 트랜잭션에서 구독을 해지한다(청구하지 않는다). 통과하면 null.
  */
-async function gate(m: EntityManager, plan: MemberPlan): Promise<Gate | null> {
+async function gate(m: EntityManager, plan: MemberPlan, log: Log): Promise<Gate | null> {
   const fresh = await m.findOne(MemberPlan, { where: { member_plan_id: plan.member_plan_id }, lock: { mode: 'pessimistic_write' } });
   const stale = staleReason(plan, fresh);
   if (stale) return { kind: 'stale', reason: stale };
@@ -190,6 +207,11 @@ async function gate(m: EntityManager, plan: MemberPlan): Promise<Gate | null> {
   if (memberRows[0]?.is_del !== IsYn.N) return { kind: 'withdrawn' };
   if (await isMemberSuspended(m, plan.member_id)) {
     await m.update(MemberPlan, { member_plan_id: plan.member_plan_id }, cancelPatch(new Date()));
+    await recordSubscriptionCancelNotice(
+      m,
+      { memberId: plan.member_id, memberPlanId: plan.member_plan_id, reason: SubscriptionCancelReason.MEMBER_SUSPENDED },
+      log,
+    );
     return { kind: 'suspended' };
   }
   return null;
@@ -208,6 +230,11 @@ async function cancelUnchargeablePlan(plan: MemberPlan, reason: string, log: Log
     const changed = staleReason(plan, fresh);
     if (changed) return changed;
     await m.update(MemberPlan, { member_plan_id: planId }, cancelPatch(new Date()));
+    await recordSubscriptionCancelNotice(
+      m,
+      { memberId: plan.member_id, memberPlanId: planId, reason: SubscriptionCancelReason.OLD_PG_CARD },
+      log,
+    );
     return null;
   });
   if (stale) {
@@ -300,9 +327,9 @@ export async function chargeDanalPlan(
   if (billing.is_active !== ActiveStatus.Y) {
     const inactive = await AppDataSource.transaction(async (m): Promise<Exclude<Claim, { kind: 'claimed' }>> => {
       await m.query(`SELECT pg_advisory_xact_lock(hashtext('subcycle:' || $1))`, [key]);
-      const blocked = await gate(m, plan);
+      const blocked = await gate(m, plan, log);
       if (blocked) return blocked;
-      return { kind: 'card_failed', transitioned: await applyFailTransition(m, plan, onFailStatus, new Date()) };
+      return { kind: 'card_failed', transitioned: await applyFailTransition(m, plan, onFailStatus, new Date(), log) };
     });
     if (inactive.kind === 'card_failed') {
       log.warn(
@@ -354,7 +381,7 @@ export async function chargeDanalPlan(
       await m.query(`SELECT pg_advisory_xact_lock(hashtext('subcycle:' || $1))`, [key]);
 
       // [H-1][H-3][정책2] 잡 시작 때 읽은 스냅샷을 믿지 않는다 — 구독 행을 잠그고 해지·탈퇴·정지를 다시 확인한다
-      const blocked = await gate(m, plan);
+      const blocked = await gate(m, plan, log);
       if (blocked) return blocked;
       // [N-5] 이 구독의 환불이 진행 중이거나 결과 불명이면 청구하지 않는다(환불받은 회원에게 다음 주기를 또 청구하지 않게)
       if (await hasUnsettledRefund(m, planId)) return { kind: 'refund_pending' };
@@ -415,22 +442,34 @@ export async function chargeDanalPlan(
 
   if (claim.kind !== 'claimed') return reportGate(claim, planId, key, log);
 
-  return settle(
-    {
-      paymentId: claim.paymentId,
-      orderId: claim.orderId,
-      plan,
-      amount,
-      credit,
-      plain,
-      orderName,
-      chargePlanId: effectivePlanId,
-      cycleYmd,
-      chargedAt,
-      onFailStatus,
-    },
-    log,
-  );
+  try {
+    return await settle(
+      {
+        paymentId: claim.paymentId,
+        orderId: claim.orderId,
+        plan,
+        amount,
+        credit,
+        plain,
+        orderName,
+        chargePlanId: effectivePlanId,
+        cycleYmd,
+        chargedAt,
+        onFailStatus,
+      },
+      log,
+    );
+  } catch (err) {
+    // settle 이 처리하지 못한 예기치 못한 예외 — 다날을 이미 호출했을 수 있으므로 CONFIRMING 은 그대로 두고 사유만 남긴다(어드민 해소).
+    // 백엔드는 이 코드를 읽어 화면 상태 '재시도대기'·사유 '배치 실패'로 보여준다. 이미 있는 fail_code(운영자 표식 등)는 덮어쓰지 않는다.
+    await record(
+      claim.paymentId,
+      { fail_code: FAIL_CODE_BATCH_FAILED, fail_reason: `배치 처리 실패: ${(err as Error)?.message ?? String(err)}` },
+      log,
+      true,
+    );
+    throw err;
+  }
 }
 
 /** 선점하지 않고 끝난 경우의 로그·결과 */
@@ -511,7 +550,7 @@ async function settle(ctx: SettleCtx, log: Log): Promise<ChargeOutcome> {
             { status: PaymentStatus.ABORTED, fail_code: err.code, fail_reason: err.message.slice(0, FAIL_REASON_MAX_LENGTH), updated_at: now },
           );
           // 조건부 전이 [N-2] — 승인 도중 해지·비활성된 구독은 덮어쓰지 않는다
-          if (!(await applyFailTransition(m, ctx.plan, ctx.onFailStatus, now))) {
+          if (!(await applyFailTransition(m, ctx.plan, ctx.onFailStatus, now, log))) {
             log.warn(`카드 거절 후 구독 상태가 이미 바뀌어 ${ctx.onFailStatus} 로 바꾸지 않음 plan=${planId}`);
           }
         });
@@ -747,11 +786,13 @@ async function record(
   paymentId: string,
   patch: { status?: string; fail_code: string; fail_reason: string; pg_transaction_id?: string },
   log: Log,
+  /** true 면 fail_code 가 아직 없는 행에만 기록한다(이미 있는 운영자 표식·결과 불명 코드를 덮어쓰지 않는다) */
+  onlyIfNoFailCode = false,
 ): Promise<void> {
   try {
     await AppDataSource.manager.update(
       Payment,
-      { payment_id: paymentId, status: PaymentStatus.CONFIRMING },
+      { payment_id: paymentId, status: PaymentStatus.CONFIRMING, ...(onlyIfNoFailCode ? { fail_code: IsNull() } : {}) },
       { ...patch, fail_reason: patch.fail_reason.slice(0, FAIL_REASON_MAX_LENGTH), updated_at: new Date() },
     );
   } catch (err) {

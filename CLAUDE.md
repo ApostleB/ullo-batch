@@ -85,6 +85,8 @@ billing 2종은 `scheduler/index.ts`에서 주석 처리되어 있으나 CLI(`np
 
 - **운영 게이트:** `DANAL_BILLING_BATCH_ENABLED` 가 정확히 `'true'` 일 때만 `executePrimary`/`executeRetry` 가 DB 를 조회하고 청구한다. 아니면 CLI 수동 실행(`npm run job billing`)도 아무것도 하지 않는다(기본 꺼짐). 스케줄러 등록은 계속 주석 처리 상태다. 다날 빌링 계약·빌링 테스트 키 확인 전에는 켜지 않는다(실연동 미검증).
 - **상태 전이표**(백엔드 `SubscriptionChargeService`/`SubscriptionSettleService` 와 같다): 결제일 21:00 청구 성공 → `ACTIVE`, 다음 결제일 = **실제 청구일 + 1개월**(`nextChargeDateFrom`). 청구 실패(카드 거절·비활성 카드) → `PAST_DUE`(결제일 유지). 다음 날 20:00 재시도(1회) 성공 → `ACTIVE`(재시도일 + 1개월), **재시도도 실패 → 해지**(`CANCELED`, `is_active=N`, `next_charge_dt=NULL`; `SUSPENDED` 는 더 이상 만들지 않는다. 지급된 크레딧은 유지). 결과 불명 → 상태 불변·`CONFIRMING` 유지. 실패 전이는 **조건부 UPDATE**(`is_del=N`·`is_active=Y`·스냅샷 `status`) — 청구 도중 해지·비활성된 구독을 덮어쓰지 않는다. 기존 DB 의 `SUSPENDED` 행은 어느 잡도 조회하지 않고, `chargeDanalPlan` 에 넘어와도 오류 없이 건너뛴다.
+- **실패 사유 코드(백엔드와 일치):** 화면 상태(결제실패/재시도대기)·사유 라벨은 백엔드가 `payment.status/fail_code` 에서 조회 시 계산한다. 배치는 `chargeDanalPlan` 의 `settle` 이 처리하지 못한 예기치 못한 예외가 새면 선점한 `CONFIRMING` 행에 `fail_code=BATCH_FAILED`(`fail_code IS NULL` 일 때만, 상태 `CONFIRMING` 유지, 예외는 그대로 던짐 — 운영자 표식·결과 불명 코드를 덮어쓰지 않는다)를 남긴다. 선점 전에 터진 예외는 결제 행이 없으므로 기록할 곳이 없고, 백엔드가 "결제일 경과 + 이번 주기 시도 없음" 을 `BATCH_NOT_RUN`(배치 미실행)으로 계산한다. 코드값·라벨·분류표는 `utils/subscription-fail-reason.util.ts`(백엔드 `subscription-display.util.ts` 복제, spec 표도 같다) — 한쪽을 바꾸면 함께 바꾼다.
+- **구독 해지 알림(카카오 스텁):** 배치가 구독을 해지하는 모든 경로 — 재시도 실패(`RETRY_FAILED`, 비활성 카드 포함), 정지 회원(`MEMBER_SUSPENDED`), 이전 PG 카드·카드 없음(`OLD_PG_CARD`) — 에서 해지 UPDATE 와 같은 트랜잭션에서 `member_notification`(category=`KAKAO_STUB`, 앱 목록에 보이지 않음)에 기록한다(`utils/subscription-cancel-notice.util.ts`, 백엔드 `SubscriptionCancelNotifier` 의 사유 코드·문구 복제). 카카오 연동·실제 발송은 없다. 알림 insert 는 `manager.transaction`(SAVEPOINT)으로 감싸 실패해도 해지·결제 트랜잭션을 깨지 않고(`[NOTIFY_FAILED]` 로그만), 해지가 롤백되면 알림도 함께 사라진다. 1차 실패(`PAST_DUE`)·결과 불명·시스템 오류 취소는 해지가 아니라 알림이 없다. 크레딧 소멸 기한 같은 정책 문구는 넣지 않는다.
 - **provider 분기**(`member_billing.provider`, 대소문자 무시): `DANAL` 만 청구한다. 그 외(INICIS·TOSS·NULL·알 수 없는 값)와 카드 정보가 없는 구독은 **결제일에 청구하지 않고 구독을 해지**한다(`cancelUnchargeablePlan` — 구독 행을 잠그고 조회 이후 바뀌지 않았을 때만, 결제 행·실패 기록 없음, 요약 로그 `해지 N건`). 결제일이 아직 오지 않았으면 건드리지 않는다(카드 교체 시간). 토스·이니시스 호출 경로는 없다.
 - **정지 회원(안전장치):** 선점 트랜잭션에서 `member_suspension`(`released_at IS NULL AND (end_at IS NULL OR end_at > 지금)`)을 확인해 청구하지 않고 구독을 해지한다. 정지 서비스가 정지 시점에 구독을 해지하므로 이 경로는 안전장치다.
 - **환불 진행 중:** 이 구독 결제에 `payment_cancel` `PENDING`/`UNKNOWN` 이 있으면 청구하지 않는다(`[CRITICAL]`, 어드민이 환불 건 해소 필요).
@@ -114,6 +116,8 @@ billing 2종은 `scheduler/index.ts`에서 주석 처리되어 있으나 CLI(`np
 - `src/utils/run-job.ts`: 모든 잡의 실행 진입점 (Advisory Lock + 재시도 + 로깅)
 - `src/utils/holiday-api.client.ts`: 공공데이터포털 `getHoliDeInfo` 호출. 결과 없는 달은 빈 배열로 정규화, `resultCode !== '00'`이면 throw
 - `src/utils/danal-billing.client.ts`: 다날 빌링 승인(`POST /billing/confirm`)·취소(`POST /payments/cancel`). 3분류 에러(`DanalApiError`=확실한 실패 / `DanalResultUnknownError`=결과 불명 / 설정 누락=일반 Error)
+- `src/utils/subscription-fail-reason.util.ts`: 실패 사유 코드·라벨·`classifyPaymentFailure`(백엔드 복제), `BATCH_FAILED` 기록값
+- `src/utils/subscription-cancel-notice.util.ts`: 구독 해지 알림 문구·`recordSubscriptionCancelNotice`(KAKAO_STUB 기록, 백엔드 복제)
 - `src/utils/subscription-cycle.util.ts`: 주기 키·시도 번호·`classifyCycle`·다음 결제일 규칙(`nextChargeDateFrom`: 실제 청구일 + 1개월) (백엔드 복제)
 - `src/utils/environment.util.ts`: `isExplicitNonProduction` — 운영 판단 기준(N-9)
 - `src/utils/test-options.ts`: 재현 전용 CLI 옵션 검증(N-8)

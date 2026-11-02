@@ -22,6 +22,7 @@ const { MemberPlan } = require('../entities/member-plan.entity');
 const { MemberCredit } = require('../entities/member-credit.entity');
 const { MemberCreditLog } = require('../entities/member-credit-log.entity');
 const { Plan } = require('../entities/plan.entity');
+const { MemberNotification } = require('../entities/member-notification.entity');
 
 class FakeDb {
   payments: Row[] = [];
@@ -29,6 +30,10 @@ class FakeDb {
   credits: Row[] = [];
   creditLogs: Row[] = [];
   masters: Row[] = [];
+  /** member_notification 행 — 구독 해지 알림(카카오 스텁) 기록 */
+  notifications: Row[] = [];
+  /** 알림 insert 가 던진다(알림 실패가 해지·결제를 깨뜨리지 않는지 확인) */
+  failNotificationInsert = false;
   members: Row[] = [];
   /** member_suspension 행 (member_id, released_at, end_at) */
   suspensions: Row[] = [];
@@ -57,6 +62,7 @@ class FakeDb {
     if (e === MemberCredit) return this.credits;
     if (e === MemberCreditLog) return this.creditLogs;
     if (e === Plan) return this.masters;
+    if (e === MemberNotification) return this.notifications;
     throw new Error('unknown entity');
   }
 
@@ -69,11 +75,12 @@ class FakeDb {
   }
 
   private matches(row: Row, where: Row): boolean {
-    return Object.entries(where).every(([k, v]) => row[k] === v);
+    // TypeORM IsNull() 연산자 — 값이 없는(null/undefined) 행만
+    return Object.entries(where).every(([k, v]) => ((v as any)?._type === 'isNull' ? row[k] == null : row[k] === v));
   }
 
   private snapshot() {
-    return structuredClone({ p: this.payments, pl: this.plans, c: this.credits, l: this.creditLogs });
+    return structuredClone({ p: this.payments, pl: this.plans, c: this.credits, l: this.creditLogs, n: this.notifications });
   }
 
   private restore(s: ReturnType<FakeDb['snapshot']>) {
@@ -81,6 +88,7 @@ class FakeDb {
     this.plans = s.pl;
     this.credits = s.c;
     this.creditLogs = s.l;
+    this.notifications = s.n;
   }
 
   private uniqueCheck(candidate: Row, selfId?: string) {
@@ -116,7 +124,7 @@ class FakeDb {
   };
 
   private build(isTx: boolean) {
-    return {
+    const mgr: any = {
       query: async (sql: string, params: any[] = []) => {
         this.queries.push({ sql, params });
         if (sql.includes('pg_advisory_xact_lock')) return [];
@@ -180,7 +188,23 @@ class FakeDb {
         }
         return { affected: rows.length };
       },
+      insert: async (E: any, row: Row) => {
+        if (E === MemberNotification && this.failNotificationInsert) throw new Error('알림 insert 실패(주입)');
+        this.table(E).push({ ...row });
+        return {};
+      },
+      // 중첩 transaction = SAVEPOINT — 콜백이 던지면 그 안의 변경(알림 행)만 되돌리고 던진다
+      transaction: async (cb: (m: any) => Promise<any>) => {
+        const snap = this.snapshot();
+        try {
+          return await cb(mgr);
+        } catch (err) {
+          this.restore(snap);
+          throw err;
+        }
+      },
     };
+    return mgr;
   }
 }
 
@@ -300,6 +324,8 @@ beforeEach(() => {
   mockDb.credits = [];
   mockDb.creditLogs = [];
   mockDb.masters = [];
+  mockDb.notifications = [];
+  mockDb.failNotificationInsert = false;
   mockDb.members = [{ member_id: 'm1', is_del: 'N' }];
   mockDb.suspensions = [];
   mockDb.cancels = [];
@@ -1531,5 +1557,136 @@ describe('[M-3] 예약(pending_plan_id) 플랜 검증 — 판매 중인 구독 �
     mockDb.masters[0].is_active = 'N';
     okConfirm();
     expect(await run()).toBe('charged');
+  });
+});
+
+// ====================================================================
+// 구독 해지 알림(카카오 알림톡 스텁) — 실제로 해지되는 모든 배치 경로에서 member_notification 에 기록한다.
+// 알림은 해지 트랜잭션 안의 SAVEPOINT 로 기록하므로, 알림 insert 실패는 해지·결제를 깨뜨리지 않는다.
+describe('[알림] 구독 해지 알림 기록', () => {
+  const notice = (reason: string) => ({
+    member_id: 'm1',
+    category: 'KAKAO_STUB',
+    link: `subscription/mp1?reason=${reason}`,
+    is_read: 'N',
+    is_del: 'N',
+  });
+
+  it('재시도 실패 해지(PAST_DUE → CANCELED)는 RETRY_FAILED 를 기록한다', async () => {
+    mockConfirm.mockRejectedValue(new DanalApiError('CARD_LIMIT', '한도 초과'));
+    await run({ onFail: 'PAST_DUE' });
+    expect(mockDb.notifications).toHaveLength(0); // 1차 실패는 해지가 아니다
+    setToday(2026, 11, 4);
+
+    await run({ plan: { ...dbPlan() }, onFail: 'CANCELED' });
+
+    expect(dbPlan().status).toBe('CANCELED');
+    expect(mockDb.notifications).toHaveLength(1);
+    expect(mockDb.notifications[0]).toMatchObject(notice('RETRY_FAILED'));
+    expect(mockDb.notifications[0].title).toBe('결제 실패로 구독이 해지되었어요');
+  });
+
+  it('비활성 카드로 재시도 잡에서 해지돼도 RETRY_FAILED', async () => {
+    mockDb.plans[0].status = 'PAST_DUE';
+    await run({ plan: { status: 'PAST_DUE' }, billing: { is_active: 'N' }, onFail: 'CANCELED' });
+    expect(dbPlan().status).toBe('CANCELED');
+    expect(mockDb.notifications.map((n) => n.link)).toEqual(['subscription/mp1?reason=RETRY_FAILED']);
+  });
+
+  it('1차 실패(ACTIVE → PAST_DUE)·결과 불명·시스템 오류 취소는 해지가 아니므로 알림이 없다', async () => {
+    mockConfirm.mockRejectedValueOnce(new DanalApiError('CARD_LIMIT', '한도 초과'));
+    await run({ onFail: 'PAST_DUE' });
+    mockConfirm.mockRejectedValueOnce(new DanalResultUnknownError('timeout'));
+    mockDb.plans[0].status = 'PAST_DUE';
+    mockDb.payments.length = 0;
+    await run({ plan: { status: 'PAST_DUE' }, onFail: 'CANCELED' });
+    expect(mockDb.notifications).toHaveLength(0);
+  });
+
+  it('이전 PG 카드 해지는 OLD_PG_CARD, 카드 없음도 OLD_PG_CARD', async () => {
+    expect(await run({ billing: { provider: 'INICIS' } })).toBe('canceled');
+    expect(mockDb.notifications.map((n) => n.link)).toEqual(['subscription/mp1?reason=OLD_PG_CARD']);
+    expect(mockDb.notifications[0]).toMatchObject(notice('OLD_PG_CARD'));
+
+    mockDb.notifications = [];
+    mockDb.plans[0] = { ...planRow() };
+    expect(await run({ billing: null })).toBe('canceled');
+    expect(mockDb.notifications.map((n) => n.link)).toEqual(['subscription/mp1?reason=OLD_PG_CARD']);
+  });
+
+  it('구독이 조회 이후 바뀌어 해지하지 못했으면(skipped) 알림도 없다', async () => {
+    Object.assign(dbPlan(), { status: 'CANCELED', is_active: 'N', next_charge_dt: null });
+    expect(await run({ billing: { provider: 'INICIS' } })).toBe('skipped');
+    expect(mockDb.notifications).toHaveLength(0);
+  });
+
+  it('정지 회원 해지는 MEMBER_SUSPENDED', async () => {
+    mockDb.suspensions.push({ member_id: 'm1', released_at: null, end_at: null });
+    expect(await run()).toBe('canceled');
+    expect(mockDb.notifications).toHaveLength(1);
+    expect(mockDb.notifications[0]).toMatchObject(notice('MEMBER_SUSPENDED'));
+    expect(mockConfirm).not.toHaveBeenCalled();
+  });
+
+  it('알림 insert 가 실패해도 해지는 그대로 완료된다(해지·결제 트랜잭션을 깨뜨리지 않는다)', async () => {
+    mockDb.failNotificationInsert = true;
+    expect(await run({ billing: { provider: 'INICIS' } })).toBe('canceled');
+    expect(dbPlan()).toMatchObject({ status: 'CANCELED', is_active: 'N', next_charge_dt: null });
+    expect(mockDb.notifications).toHaveLength(0);
+    expect(JSON.stringify(log.error.mock.calls)).toContain('NOTIFY_FAILED');
+
+    // 재시도 실패 해지도 마찬가지 — 거절 기록(ABORTED)과 해지가 유지된다
+    mockDb.plans[0] = { ...planRow({ status: 'PAST_DUE' }) };
+    mockConfirm.mockRejectedValue(new DanalApiError('CARD_LIMIT', '한도 초과'));
+    expect(await run({ plan: { status: 'PAST_DUE' }, onFail: 'CANCELED' })).toBe('failed');
+    expect(dbPlan().status).toBe('CANCELED');
+    expect(mockDb.payments.at(-1)).toMatchObject({ status: 'ABORTED', fail_code: 'CARD_LIMIT' });
+  });
+});
+
+// ====================================================================
+// 실패 사유 — 배치가 처리 중 예기치 못한 예외를 만나면 CONFIRMING 행에 fail_code=BATCH_FAILED 를 남긴다
+// (백엔드가 이 코드를 읽어 화면 상태 '재시도대기' · 사유 '배치 실패' 로 보여준다)
+describe('[실패 사유] BATCH_FAILED', () => {
+  /** transactionId 를 읽는 순간 던지는 승인 응답 — settle 본문의 try/catch 밖에서 터지는 예외를 흉내 낸다 */
+  const explodingResponse = () => ({
+    get transactionId(): string {
+      throw new Error('unexpected failure');
+    },
+  });
+
+  it('settle 밖으로 예외가 새면 CONFIRMING 은 유지하고 fail_code=BATCH_FAILED 를 기록한 뒤 예외를 던진다', async () => {
+    mockConfirm.mockResolvedValue(explodingResponse());
+    await expect(run()).rejects.toThrow('unexpected failure');
+    expect(mockDb.payments).toHaveLength(1);
+    expect(mockDb.payments[0]).toMatchObject({ order_id: `${K}_1`, status: 'CONFIRMING', fail_code: 'BATCH_FAILED' });
+    expect(mockDb.payments[0].fail_reason).toContain('unexpected failure');
+    expect(dbPlan().status).toBe('ACTIVE'); // 구독 상태는 바꾸지 않는다
+  });
+
+  it('이미 있는 fail_code 는 덮어쓰지 않는다 (fail_code IS NULL 조건)', async () => {
+    mockConfirm.mockImplementation(async () => {
+      mockDb.payments[0].fail_code = 'ADMIN_CANCEL_PENDING'; // 승인 도중 운영자가 취소를 시작
+      return explodingResponse();
+    });
+    await expect(run()).rejects.toThrow('unexpected failure');
+    expect(mockDb.payments[0].fail_code).toBe('ADMIN_CANCEL_PENDING');
+  });
+
+  it('BATCH_FAILED 기록이 실패해도 원래 예외를 가리지 않는다', async () => {
+    mockConfirm.mockResolvedValue(explodingResponse());
+    const realUpdate = mockDb.manager.update;
+    jest.spyOn(mockDb.manager, 'update').mockImplementation((async (E: any, criteria: Row, patch: Row) => {
+      if (patch?.fail_code === 'BATCH_FAILED') throw new Error('db down');
+      return realUpdate(E, criteria, patch);
+    }) as any);
+    await expect(run()).rejects.toThrow('unexpected failure');
+    expect(mockDb.payments[0]).toMatchObject({ status: 'CONFIRMING', fail_code: null });
+  });
+
+  it('정상 경로(거절·결과 불명)는 BATCH_FAILED 로 덮어쓰지 않는다', async () => {
+    mockConfirm.mockRejectedValue(new DanalResultUnknownError('timeout'));
+    await run();
+    expect(mockDb.payments[0].fail_code).toBe('CONFIRM_UNKNOWN');
   });
 });
