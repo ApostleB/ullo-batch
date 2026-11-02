@@ -17,6 +17,7 @@ describe('실패 사유 코드값·라벨 (백엔드와 일치)', () => {
     expect(FAIL_REASON_LABELS[FailReasonCode.SYSTEM_ERROR]).toBe('시스템 오류');
     expect(FAIL_REASON_LABELS[FailReasonCode.PG_DECLINED]).toBe('카드사 거절');
     expect(FAIL_REASON_LABELS[FailReasonCode.CARD_UNAVAILABLE]).toBe('결제 카드 사용 불가');
+    expect(FAIL_REASON_LABELS[FailReasonCode.ADMIN_RESOLVED]).toBe('운영자 해소'); // [P-3]
   });
 
   it('배치가 payment.fail_code 에 기록하는 값은 사유 코드와 같은 문자열이다', () => {
@@ -41,6 +42,10 @@ describe('classifyPaymentFailure — payment.status/fail_code → 사유 (백엔
     ['ABORTED', 'GRANT_FAILED_CANCELED', FailReasonCode.SYSTEM_ERROR, 'RETRY_PENDING'],
     ['ABORTED', 'SYSTEM_ERROR', FailReasonCode.SYSTEM_ERROR, 'RETRY_PENDING'],
     ['CONFIRMING', 'BATCH_FAILED', FailReasonCode.BATCH_FAILED, 'RETRY_PENDING'],
+    // [P-3] 운영자가 미승인·취소로 해소한 건은 카드사 거절이 아니다
+    ['ABORTED', 'ADMIN_RESOLVED_ABORT', FailReasonCode.ADMIN_RESOLVED, 'RETRY_PENDING'],
+    ['ABORTED', 'ADMIN_RESOLVED_CANCELED', FailReasonCode.ADMIN_RESOLVED, 'RETRY_PENDING'],
+    ['ABORTED', 'ADMIN_ABORTED', FailReasonCode.ADMIN_RESOLVED, 'RETRY_PENDING'],
     ['CONFIRMING', 'SOMETHING_NEW', FailReasonCode.SYSTEM_ERROR, 'RETRY_PENDING'],
   ])('%s + %s → %s (%s)', (status, failCode, reason, state) => {
     expect(classifyPaymentFailure({ status, fail_code: failCode })).toEqual({ reason, state });
@@ -54,5 +59,20 @@ describe('classifyPaymentFailure — payment.status/fail_code → 사유 (백엔
     [null, null],
   ])('%s + %s 는 실패가 아니다', (status, failCode) => {
     expect(classifyPaymentFailure({ status, fail_code: failCode })).toBeNull();
+  });
+});
+
+describe('[P-4] 처리가 끊긴 CONFIRMING (백엔드와 일치)', () => {
+  const NOW = new Date(2026, 10, 10, 12, 0, 0);
+  const at = (minutesAgo: number) => new Date(NOW.getTime() - minutesAgo * 60_000);
+
+  it('fail_code 없는 CONFIRMING 은 2분 안에는 진행 중, 2분 넘으면 PG 응답 없음(재시도대기)', () => {
+    expect(classifyPaymentFailure({ status: 'CONFIRMING', fail_code: null, updated_at: at(1) }, NOW)).toBeNull();
+    expect(classifyPaymentFailure({ status: 'CONFIRMING', fail_code: null, updated_at: at(10) }, NOW)).toEqual({
+      reason: FailReasonCode.PG_NO_RESPONSE,
+      state: 'RETRY_PENDING',
+    });
+    // 갱신 시각을 모르면 진행 중으로 본다
+    expect(classifyPaymentFailure({ status: 'CONFIRMING', fail_code: null }, NOW)).toBeNull();
   });
 });

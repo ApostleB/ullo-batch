@@ -13,14 +13,37 @@ const METHOD_CARD = 'CARD';
 const CANCEL_REASON_MAX_BYTES = 255;
 const ORDER_NAME_MAX_BYTES = 80;
 
-/** 다날이 실패 code 를 명시적으로 돌려준 경우 — 확실한 실패 */
+/**
+ * 다날 응답 실패의 성격 — 백엔드 src/payment/danal.client.ts 의 classifyDanalFailure 와 같다(복제).
+ * CARD_DECLINED 는 카드사 거절로 확정해 구독 상태를 전이해도 되는 경우, NON_CARD 는 가맹점·인증·계약·요청·호출 한도 오류처럼
+ * 카드와 무관해 구독 상태를 바꾸면 안 되는 경우다.
+ */
+export type DanalFailureKind = 'CARD_DECLINED' | 'NON_CARD';
+
+/** 가맹점·인증·계약·요청 형식·호출 한도 오류로 보이는 code 패턴 — 다날 오류 코드 표(Q-B11) 답변 전까지의 보수적 임시 분류 */
+const NON_CARD_CODE_PATTERN =
+  /UNAUTHORIZED|UNAUTHENTICATED|FORBIDDEN|SECRET|API_?KEY|MERCHANT|CONTRACT|PERMISSION|NOT_ALLOWED|TOO_MANY|RATE_?LIMIT|THROTTL|INVALID_(REQUEST|PARAM)|BAD_REQUEST|MAINTENANCE|SERVICE_UNAVAILABLE|\bIP\b/i;
+
+/** 2xx 가 아닌 응답은 code 와 무관하게 카드 거절이 아니다. 2xx 비SUCCESS 는 code 패턴으로 구분한다. */
+export function classifyDanalFailure(httpStatus: number, code: string): DanalFailureKind {
+  if (httpStatus < 200 || httpStatus >= 300) return 'NON_CARD';
+  return NON_CARD_CODE_PATTERN.test(code) ? 'NON_CARD' : 'CARD_DECLINED';
+}
+
+/** 다날이 실패 code 를 명시적으로 돌려준 경우 — HTTP 상태를 함께 싣는다. 카드 거절인지는 isCardDecline 으로 본다. */
 export class DanalApiError extends Error {
   constructor(
     public readonly code: string,
     message: string,
+    public readonly httpStatus: number = 200,
   ) {
     super(message);
     this.name = 'DanalApiError';
+  }
+
+  /** 카드사 거절로 확정할 수 있는가 — false 면 구독 상태를 바꾸지 말고 시스템 오류로 기록한다 */
+  get isCardDecline(): boolean {
+    return classifyDanalFailure(this.httpStatus, this.code) === 'CARD_DECLINED';
   }
 }
 
@@ -143,7 +166,7 @@ async function post(path: string, body: Record<string, unknown>): Promise<Record
     throw new DanalResultUnknownError(`다날 응답 형식을 해석할 수 없습니다. (HTTP ${res.status})`);
   }
   if (code !== SUCCESS_CODE) {
-    throw new DanalApiError(code, asString(data.message) ?? '다날 요청이 실패했습니다.');
+    throw new DanalApiError(code, asString(data.message) ?? '다날 요청이 실패했습니다.', res.status);
   }
   return data;
 }

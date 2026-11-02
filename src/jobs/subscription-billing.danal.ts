@@ -19,7 +19,8 @@ import {
 } from '../utils/subscription-cycle.util';
 import { addMonthsClamped, formatLocalDateTime, toLocalDate, today, ymd } from '../utils/date.util';
 import { createJobLogger } from '../logger';
-import { FAIL_CODE_BATCH_FAILED } from '../utils/subscription-fail-reason.util';
+import { FAIL_CODE_BATCH_FAILED, FAIL_CODE_SYSTEM_ERROR } from '../utils/subscription-fail-reason.util';
+import { pastDueTransitionedToday } from '../utils/subscription-retry-guard.util';
 import { recordSubscriptionCancelNotice, SubscriptionCancelReason } from '../utils/subscription-cancel-notice.util';
 
 /**
@@ -34,7 +35,7 @@ import { recordSubscriptionCancelNotice, SubscriptionCancelReason } from '../uti
 
 type Log = ReturnType<typeof createJobLogger>;
 
-export type ChargeOutcome = 'charged' | 'skipped' | 'failed' | 'unknown' | 'canceled';
+export type ChargeOutcome = 'charged' | 'skipped' | 'failed' | 'declined' | 'system_error' | 'unknown' | 'canceled';
 /**
  * 카드 거절 시 구독 상태 전이 — 1차 잡은 PAST_DUE(다음 날 1회 재시도), 재시도 잡은 CANCELED(해지, 다음 결제 없음).
  * SUSPENDED 는 더 이상 만들지 않는다(기존 DB 행은 어떤 잡도 조회하지 않는다).
@@ -281,13 +282,17 @@ type Claim =
   | { kind: 'refund_pending' }
   | { kind: 'blocked'; failCode: string }
   | { kind: 'card_failed'; transitioned: boolean }
+  | { kind: 'retry_deferred' }
   | { kind: 'claimed'; paymentId: string; orderId: string };
 
 /**
  * 다날 카드 구독 1건을 청구한다.
  * - 'charged'  : 승인·지급 완료 (T4)
  * - 'skipped'  : 청구하지 않음 (T1 결제일만 전진·T2·T3·T11, 사전 검증 불가, 결정 4)
- * - 'failed'   : 확실한 실패 (T5 카드 거절 → 구독 상태 전이 / T8·T9 취소 성공 → 상태 불변)
+ * - 'declined' : 카드사가 거절 (T5) — 구독 상태를 전이했다(1차 PAST_DUE / 재시도 CANCELED). 잡이 거절 비율을 보고 이상 징후면 중단한다 [P-1]
+ * - 'system_error' : 다날이 카드 거절이 아닌 오류(HTTP 2xx 외·가맹점·인증·계약 코드)를 돌려줌 [P-1] — 결제 ABORTED+SYSTEM_ERROR, 구독 상태 불변,
+ *                같은 주기는 다음 실행에서 다음 시도 번호로 다시 청구한다
+ * - 'failed'   : 그 밖의 확실한 실패 (비활성 카드 전이 / T8·T9 취소 성공 → 상태 불변)
  * - 'unknown'  : 결과 불명 (T6·T7·T10, 취소 실패) — CONFIRMING 으로 남겨 어드민이 해소한다
  * - 'canceled' : 청구 없이 구독을 해지함 (이전 PG 카드·카드 없음[정책3], 활성 정지 회원[정책2])
  */
@@ -329,6 +334,10 @@ export async function chargeDanalPlan(
       await m.query(`SELECT pg_advisory_xact_lock(hashtext('subcycle:' || $1))`, [key]);
       const blocked = await gate(m, plan, log);
       if (blocked) return blocked;
+      // [P-5] 오늘 이미 실패 전이된 PAST_DUE 는 같은 날 한 번 더 전이(=해지)하지 않는다 — 다음 날 재시도
+      if (pastDueTransitionedToday({ status: plan.status, updated_at: plan.updated_at }, [], ymd(today()))) {
+        return { kind: 'retry_deferred' };
+      }
       return { kind: 'card_failed', transitioned: await applyFailTransition(m, plan, onFailStatus, new Date(), log) };
     });
     if (inactive.kind === 'card_failed') {
@@ -386,9 +395,16 @@ export async function chargeDanalPlan(
       // [N-5] 이 구독의 환불이 진행 중이거나 결과 불명이면 청구하지 않는다(환불받은 회원에게 다음 주기를 또 청구하지 않게)
       if (await hasUnsettledRefund(m, planId)) return { kind: 'refund_pending' };
 
-      const rows: { payment_id: string; order_id: string | null; status: string | null; fail_code: string | null; paid_at: Date | string | null }[] =
+      const rows: {
+        payment_id: string;
+        order_id: string | null;
+        status: string | null;
+        fail_code: string | null;
+        paid_at: Date | string | null;
+        updated_at: Date | string | null;
+      }[] =
         await m.query(
-          `SELECT payment_id, order_id, status, fail_code, paid_at FROM payment WHERE order_id = $1 OR order_id LIKE $2 ESCAPE '\\'`,
+          `SELECT payment_id, order_id, status, fail_code, paid_at, updated_at FROM payment WHERE order_id = $1 OR order_id LIKE $2 ESCAPE '\\'`,
           [key, cycleLikePattern(key)],
         );
       const cycle = classifyCycle(rows, key);
@@ -408,6 +424,11 @@ export async function chargeDanalPlan(
           isCycleOrderId(r.order_id, key),
       );
       if (blockedRow) return { kind: 'blocked', failCode: blockedRow.fail_code! };
+      // [P-5] 오늘 거절 전이된 PAST_DUE 는 다음 날 재시도한다(같은 날 두 번째 거절로 해지되지 않게)
+      const cycleRows = rows.filter((r) => isCycleOrderId(r.order_id, key));
+      if (pastDueTransitionedToday({ status: plan.status, updated_at: plan.updated_at }, cycleRows, ymd(today()))) {
+        return { kind: 'retry_deferred' };
+      }
 
       const orderId = attemptOrderId(key, cycle.nextAttempt); // [T13]
       const now = new Date();
@@ -505,6 +526,9 @@ function reportGate(claim: Exclude<Claim, { kind: 'claimed' }>, planId: string, 
       return 'skipped';
     case 'card_failed':
       return 'failed';
+    case 'retry_deferred':
+      log.warn(`오늘 이미 결제 실패로 전이된 구독이라 다음 날 재시도함(같은 날 두 번째 거절로 해지하지 않음) plan=${planId} key=${key}`);
+      return 'skipped';
   }
 }
 
@@ -538,6 +562,23 @@ async function settle(ctx: SettleCtx, log: Log): Promise<ChargeOutcome> {
       orderId: ctx.orderId,
     });
   } catch (err) {
+    if (err instanceof DanalApiError && !err.isCardDecline) {
+      // [P-1] 카드 거절이 아니다(HTTP 2xx 외 응답, 가맹점·인증·계약 오류 코드). 거절로 전이하지 않는다 — 구독 상태 불변.
+      // 다날이 요청을 처리하지 않았으므로 선점 행을 ABORTED+SYSTEM_ERROR 로 닫아 같은 주기를 다음 실행에서 다음 시도 번호로 다시 청구할 수 있게 한다.
+      log.error(
+        `[CRITICAL] 다날이 카드 거절이 아닌 오류를 돌려줌 — 시스템 오류로 기록, 구독 상태 불변 plan=${planId} order=${ctx.orderId} http=${err.httpStatus} code=${err.code}`,
+      );
+      await record(
+        ctx.paymentId,
+        {
+          status: PaymentStatus.ABORTED,
+          fail_code: FAIL_CODE_SYSTEM_ERROR,
+          fail_reason: `다날 요청 거부(HTTP ${err.httpStatus} ${err.code}): ${err.message}`,
+        },
+        log,
+      );
+      return 'system_error';
+    }
     if (err instanceof DanalApiError) {
       // [T5] 다날이 code 로 거절 — 확실한 실패. 선점 행을 ABORTED 로 닫고 구독 상태를 전이한다(별도 _fail_ 행 없음)
       log.warn(`결제 실패 plan=${planId} [${err.code}] ${err.message} → ${ctx.onFailStatus}`);
@@ -557,7 +598,7 @@ async function settle(ctx: SettleCtx, log: Log): Promise<ChargeOutcome> {
       } catch (dbErr) {
         log.error(`[CRITICAL] 거절 결과 기록 실패 — 수동 정합 필요 order=${ctx.orderId}: ${(dbErr as Error).message}`);
       }
-      return 'failed';
+      return 'declined';
     }
     // [T6] 결과 불명 — 재시도하지 않는다. 구독 상태도 바꾸지 않는다
     log.error(`[CONFIRM_UNKNOWN] 다날 빌링 승인 결과 불명 order=${ctx.orderId}: ${(err as Error).message}`);

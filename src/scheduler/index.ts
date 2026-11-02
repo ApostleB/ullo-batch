@@ -25,9 +25,9 @@ export function startScheduler(): void {
   })
 
   // ── 구독 정기결제(subscription-billing) — 미사용으로 잡 등록 비활성화 ──
-  // 정기구독 기능을 쓰지 않기로 해서 스케줄 등록하지 않는다(자동 청구 없음).
-  // 이니시스 전환 코드(subscription-billing.job / inipay-billing.client)는 그대로 두어
-  // 정책이 정해지면 아래 주석만 해제하면 되도록 한다. CLI 수동 실행은 여전히 가능:
+  // 다날 구독 청구(subscription-billing.job / subscription-billing.danal)는 운영 게이트(DANAL_BILLING_BATCH_ENABLED)와
+  // 다날 빌링 계약·실연동 확인 전이라 스케줄 등록하지 않는다(자동 청구 없음). 확인되면 아래 주석을 해제하고 게이트를 켠다.
+  // (inipay-billing.client 는 이니시스 시절 잔존 코드로 청구 잡이 호출하지 않는다.) CLI 수동 실행은 가능하다(게이트가 켜져야 청구):
   //   npm run job billing / npm run job billing-retry
   // 구독 정기결제 — 매일 21:00 (재시도는 매일 20:00). 잡 내부에서 건별 처리하므로 p-retry는 0.
   // registerJob(jobs, {

@@ -7,7 +7,14 @@ import 'reflect-metadata';
 const mockConfig = {
   env: 'local',
   nodeEnv: 'local',
-  danal: { secretKey: 'fake-secret', merchantId: 'fake-merchant', apiBaseUrl: 'https://danal.test', batchEnabled: true },
+  danal: {
+    secretKey: 'fake-secret',
+    merchantId: 'fake-merchant',
+    apiBaseUrl: 'https://danal.test',
+    batchEnabled: true,
+    billingAbortRatio: 0.5,
+    billingAbortMinSample: 5,
+  },
   billing: { encKey: '' },
   toss: { secretKey: 'fake-toss', baseUrl: 'https://toss.test' },
 };
@@ -65,6 +72,8 @@ const summary = () => log.info.mock.calls.map((c: unknown[]) => String(c[0])).fi
 beforeEach(() => {
   jest.clearAllMocks();
   mockConfig.danal.batchEnabled = true;
+  mockConfig.danal.billingAbortRatio = 0.5;
+  mockConfig.danal.billingAbortMinSample = 5;
   plans = [];
   billings = {};
   memberPlanRepo.find.mockImplementation(async () => plans);
@@ -326,5 +335,101 @@ describe('테스트 옵션 --member (재현 전용)', () => {
     await executeRetry(log);
     for (const w of memberPlanRepo.find.mock.calls[0][0].where) expect(w.member_id).toBe('m-only');
     expect(memberPlanRepo.find.mock.calls[1][0].where.member_id).toBe('m-only');
+  });
+});
+
+// 10 P-1 — 한 잡에서 카드 거절·다날 비카드 오류 비율이 임계를 넘으면 잡을 중단한다(되돌릴 수 없는 대량 해지 차단).
+describe('[P-1] 거절·비카드 오류 비율이 임계를 넘으면 잡을 중단한다', () => {
+  // 앞 테스트가 중단돼 쓰지 않은 Once 결과가 큐에 남지 않게 한다(clearAllMocks 는 큐를 비우지 않는다)
+  beforeEach(() => {
+    mockChargeDanalPlan.mockReset();
+    mockChargeDanalPlan.mockResolvedValue('charged');
+  });
+  const many = (n: number) => {
+    plans = Array.from({ length: n }, (_, i) => planRow(`mp${i}`, 'b1'));
+    billings.b1 = billing('b1', 'DANAL');
+  };
+  const results = (...r: string[]) => r.forEach(x => mockChargeDanalPlan.mockResolvedValueOnce(x));
+
+  it('재현: 재시도 잡에서 전부 거절로 나오면(비밀키 오교체·계약 만료) 표본 5건에서 멈추고 나머지 구독은 건드리지 않는다', async () => {
+    many(20);
+    results(...Array(20).fill('declined'));
+
+    await expect(executeRetry(log)).rejects.toThrow('[CRITICAL]');
+
+    expect(mockChargeDanalPlan).toHaveBeenCalledTimes(5);
+    expect(JSON.stringify(log.error.mock.calls)).toContain('[CRITICAL]');
+    expect(JSON.stringify(log.error.mock.calls)).toContain('중단');
+    expect(summary()).toBeDefined(); // 중단해도 요약은 남긴다
+  });
+
+  it('1차 잡도 같다', async () => {
+    many(12);
+    results(...Array(12).fill('declined'));
+    await expect(executePrimary(log)).rejects.toThrow('[CRITICAL]');
+    expect(mockChargeDanalPlan).toHaveBeenCalledTimes(5);
+  });
+
+  it('다날 비카드 오류(system_error)도 같은 임계로 센다 — 전부 401 이면 헛돌지 않고 멈춘다', async () => {
+    many(20);
+    results(...Array(20).fill('system_error'));
+    await expect(executePrimary(log)).rejects.toThrow('[CRITICAL]');
+    expect(mockChargeDanalPlan).toHaveBeenCalledTimes(5);
+  });
+
+  it('최소 표본(5건) 전에는 중단하지 않는다 — 4건 전부 거절이어도 끝까지 처리', async () => {
+    many(4);
+    results('declined', 'declined', 'declined', 'declined');
+    await executeRetry(log);
+    expect(mockChargeDanalPlan).toHaveBeenCalledTimes(4);
+    expect(summary()).toContain('실패 4');
+  });
+
+  it('정상 범위(거절 비율 임계 이하)는 끝까지 처리한다: 10건 중 5건 거절 = 0.5 는 넘지 않는다', async () => {
+    many(10);
+    results('charged', 'declined', 'charged', 'declined', 'charged', 'declined', 'charged', 'declined', 'charged', 'declined');
+    await executePrimary(log);
+    expect(mockChargeDanalPlan).toHaveBeenCalledTimes(10);
+    expect(summary()).toBe('처리 결과: 성공 5, 건너뜀 0, 실패 5, 결과 불명 0, 해지 0, 오류 0건');
+  });
+
+  it('성공이 섞여 비율이 낮으면 거절이 연달아 나와도 중단하지 않는다', async () => {
+    many(30);
+    results(...Array(20).fill('charged'), ...Array(10).fill('declined'));
+    await executePrimary(log);
+    expect(mockChargeDanalPlan).toHaveBeenCalledTimes(30);
+  });
+
+  it('건너뜀·해지(이전 PG 등)는 표본에 넣지 않는다 — 다날을 호출하지 않았기 때문', async () => {
+    many(12);
+    results(...Array(8).fill('skipped'), 'canceled', 'canceled', 'declined', 'declined');
+    await executePrimary(log);
+    expect(mockChargeDanalPlan).toHaveBeenCalledTimes(12);
+  });
+
+  it('임계는 설정으로 바꾼다: 비율 0.9·표본 10', async () => {
+    mockConfig.danal.billingAbortRatio = 0.9;
+    mockConfig.danal.billingAbortMinSample = 10;
+    many(20);
+    results(...Array(20).fill('declined'));
+    await expect(executePrimary(log)).rejects.toThrow('[CRITICAL]');
+    expect(mockChargeDanalPlan).toHaveBeenCalledTimes(10);
+  });
+
+  it('설정이 없는 환경(구 설정)에서도 기본값(0.5, 5)으로 동작한다', async () => {
+    delete (mockConfig.danal as any).billingAbortRatio;
+    delete (mockConfig.danal as any).billingAbortMinSample;
+    many(20);
+    results(...Array(20).fill('declined'));
+    await expect(executePrimary(log)).rejects.toThrow('[CRITICAL]');
+    expect(mockChargeDanalPlan).toHaveBeenCalledTimes(5);
+  });
+
+  it('비카드 오류가 있으면 요약과 별도로 [CRITICAL] 로 알린다', async () => {
+    many(2);
+    results('system_error', 'charged');
+    await executePrimary(log);
+    expect(JSON.stringify(log.error.mock.calls)).toContain('[CRITICAL]');
+    expect(JSON.stringify(log.error.mock.calls)).toContain('카드 거절이 아닌');
   });
 });

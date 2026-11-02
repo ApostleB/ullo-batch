@@ -25,7 +25,7 @@ interface Message {
   body: string;
 }
 
-/** 크레딧 소멸 기한 같은 정책 문구는 넣지 않는다(정책 확인 중) */
+/** 크레딧 소멸 기한 같은 정책 문구는 넣지 않는다 — 해지해도 크레딧은 유효기간까지 유지되고, 만료 15일 전 안내는 credit-expiry-notice 잡이 따로 기록한다(2026-11-03 확정) */
 const MESSAGES: Record<SubscriptionCancelReasonType, Message> = {
   USER_CANCELED: {
     title: '구독이 해지되었어요',

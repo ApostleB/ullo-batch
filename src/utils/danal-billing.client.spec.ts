@@ -12,7 +12,7 @@ const mockConfig = {
 jest.mock('../config', () => ({ config: mockConfig }));
 jest.mock('axios');
 
-import { cancel, confirmBilling, DanalApiError, DanalResultUnknownError } from './danal-billing.client';
+import { cancel, classifyDanalFailure, confirmBilling, DanalApiError, DanalResultUnknownError } from './danal-billing.client';
 
 const post = axios.post as jest.Mock;
 const input = {
@@ -103,6 +103,47 @@ describe('danal-billing.client — confirmBilling', () => {
     mockConfig.danal.merchantId = '';
     await expect(confirmBilling(input)).rejects.toThrow('DANAL_MERCHANT_ID');
     expect(post).not.toHaveBeenCalled();
+  });
+});
+
+// [P-1] 백엔드 src/payment/danal.client.spec.ts 의 분류 표와 같다(복제) — 한쪽을 바꾸면 함께 바꾼다.
+describe('danal-billing.client — DanalApiError 분류 (P-1)', () => {
+  it.each([401, 403, 404, 408, 422, 429, 400])('HTTP %i 응답은 code 가 있어도 카드 거절이 아니다', async (status) => {
+    post.mockResolvedValue({ status, data: { code: 'E100', message: 'x' } });
+    const err = await confirmBilling(input).catch((e) => e);
+    expect(err).toBeInstanceOf(DanalApiError);
+    expect(err.httpStatus).toBe(status);
+    expect(err.isCardDecline).toBe(false);
+  });
+
+  it('HTTP 200 + 비SUCCESS 일반 코드는 카드 거절 (httpStatus 보존)', async () => {
+    post.mockResolvedValue({ status: 200, data: { code: 'E300', message: '한도 초과' } });
+    const err = await confirmBilling(input).catch((e) => e);
+    expect(err.httpStatus).toBe(200);
+    expect(err.isCardDecline).toBe(true);
+  });
+
+  it.each(['UNAUTHORIZED', 'INVALID_SECRET_KEY', 'MERCHANT_NOT_FOUND', 'CONTRACT_EXPIRED', 'FORBIDDEN_IP', 'TOO_MANY_REQUESTS', 'INVALID_PARAMETER'])(
+    'HTTP 200 이어도 가맹점·인증·계약 오류로 보이는 코드(%s)는 카드 거절이 아니다',
+    async (code) => {
+      post.mockResolvedValue({ status: 200, data: { code, message: 'x' } });
+      const err = await confirmBilling(input).catch((e) => e);
+      expect(err.isCardDecline).toBe(false);
+    },
+  );
+
+  it('cancel 도 같은 분류를 갖는다', async () => {
+    post.mockResolvedValue({ status: 401, data: { code: 'E1', message: 'x' } });
+    const err = await cancel({ transactionId: 't', amount: 1, cancelType: 'C' }).catch((e) => e);
+    expect(err.httpStatus).toBe(401);
+  });
+
+  it('classifyDanalFailure 표', () => {
+    expect(classifyDanalFailure(401, 'CARD_DECLINED')).toBe('NON_CARD');
+    expect(classifyDanalFailure(200, 'CARD_DECLINED')).toBe('CARD_DECLINED');
+    expect(classifyDanalFailure(200, 'api_key_invalid')).toBe('NON_CARD');
+    expect(classifyDanalFailure(200, '한도초과')).toBe('CARD_DECLINED');
+    expect(new DanalApiError('E1', 'x').httpStatus).toBe(200);
   });
 });
 

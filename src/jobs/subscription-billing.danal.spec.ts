@@ -139,6 +139,7 @@ class FakeDb {
               status: p.status,
               fail_code: p.fail_code ?? null,
               paid_at: p.paid_at ?? null,
+              updated_at: p.updated_at ?? null,
             }));
         }
         if (sql.includes('FROM member_suspension')) {
@@ -509,13 +510,146 @@ describe('[T4] 승인 성공 + 대조 일치 → 지급', () => {
   });
 });
 
+// 10 P-1 — 카드 거절이 아닌 다날 오류(HTTP 2xx 외, 가맹점·인증·계약 코드)는 구독 상태를 바꾸지 않고 시스템 오류로 기록한다.
+describe('[P-1] 카드 거절이 아닌 다날 오류는 거절로 전이하지 않는다', () => {
+  const nonCard = [
+    ['HTTP 401', () => new DanalApiError('E100', '인증 실패', 401)],
+    ['HTTP 403', () => new DanalApiError('E100', '권한 없음', 403)],
+    ['HTTP 429', () => new DanalApiError('E100', '호출 한도', 429)],
+    ['HTTP 400', () => new DanalApiError('INVALID_REQUEST', '요청 오류', 400)],
+    ['HTTP 200 + 가맹점 코드', () => new DanalApiError('MERCHANT_NOT_FOUND', '가맹점 없음', 200)],
+  ] as const;
+
+  it.each(nonCard)('%s — 1차 잡: ABORTED+SYSTEM_ERROR, 구독은 ACTIVE 그대로(PAST_DUE 로도 바꾸지 않는다), 해지 알림 없음', async (_n, make) => {
+    mockConfirm.mockRejectedValue(make());
+
+    const r = await run({ onFail: 'PAST_DUE' });
+
+    expect(r).toBe('system_error');
+    expect(mockConfirm).toHaveBeenCalledTimes(1);
+    expect(mockDb.payments).toHaveLength(1);
+    expect(mockDb.payments[0]).toMatchObject({ order_id: `${K}_1`, status: 'ABORTED', fail_code: 'SYSTEM_ERROR' });
+    expect(String(mockDb.payments[0].fail_reason)).toContain('다날 요청 거부');
+    expect(dbPlan()).toMatchObject({ status: 'ACTIVE', is_active: 'Y' });
+    expect(String(dbPlan().next_charge_dt).slice(0, 10)).toBe('2026-11-03');
+    expect(mockDb.notifications).toHaveLength(0);
+    expect(mockCancel).not.toHaveBeenCalled();
+  });
+
+  it.each(nonCard)('%s — 재시도 잡(onFail=CANCELED): PAST_DUE 를 해지하지 않는다 (재현: 비밀키 오교체로 이틀 만에 전부 해지)', async (_n, make) => {
+    mockDb.plans[0].status = 'PAST_DUE';
+    mockConfirm.mockRejectedValue(make());
+
+    const r = await run({ plan: { status: 'PAST_DUE' }, onFail: 'CANCELED' });
+
+    expect(r).toBe('system_error');
+    expect(dbPlan()).toMatchObject({ status: 'PAST_DUE', is_active: 'Y' });
+    expect(String(dbPlan().next_charge_dt).slice(0, 10)).toBe('2026-11-03');
+    expect(dbPlan().canceled_at).toBeNull();
+    expect(mockDb.notifications).toHaveLength(0);
+    expect(mockDb.payments[0]).toMatchObject({ status: 'ABORTED', fail_code: 'SYSTEM_ERROR' });
+  });
+
+  it('같은 주기를 다음 실행에서 다음 시도 번호(_2)로 다시 청구한다 — 중복 청구 없이 (주기 키 규칙 유지)', async () => {
+    mockConfirm.mockRejectedValueOnce(new DanalApiError('E100', '인증 실패', 401));
+    expect(await run()).toBe('system_error');
+
+    okConfirm();
+    expect(await run()).toBe('charged');
+
+    expect(mockDb.payments.map((p) => [p.order_id, p.status])).toEqual([
+      [`${K}_1`, 'ABORTED'],
+      [`${K}_2`, 'DONE'],
+    ]);
+    expect(mockConfirm).toHaveBeenCalledTimes(2);
+  });
+
+  it('비카드 오류 로그는 [CRITICAL] 이며 빌링키·비밀키가 없다', async () => {
+    mockConfirm.mockRejectedValue(new DanalApiError('E100', '인증 실패', 401));
+    await run();
+    expect(JSON.stringify(log.error.mock.calls)).toContain('[CRITICAL]');
+    expect(logged()).not.toContain(PLAIN_KEY);
+    expect(logged()).not.toContain('fake-secret');
+  });
+});
+
+// 10 P-5 — 같은 날 두 번째 거절로 해지되지 않는다 (배치 재시도 잡). 백엔드 어드민 수동 청구와 같은 판정(subscription-retry-guard.util).
+describe('[P-5] 다음 날 재시도 강제', () => {
+  const declinedRow = (day: number, hour = 19) =>
+    row(`${K}_1`, 'ABORTED', { fail_code: 'CARD_LIMIT', updated_at: new Date(2026, 10, day, hour, 50, 0) });
+
+  it('재현: 19:50 수동 청구가 거절 전이시킨 PAST_DUE 를 20:00 재시도 잡이 같은 날 청구하지 않는다 — 다날 호출·결제 행·해지 없음', async () => {
+    mockDb.plans[0].status = 'PAST_DUE';
+    mockDb.payments.push(declinedRow(3));
+    mockConfirm.mockRejectedValue(new DanalApiError('CARD_LIMIT', '한도 초과'));
+
+    const r = await run({ plan: { status: 'PAST_DUE' }, onFail: 'CANCELED' });
+
+    expect(r).toBe('skipped');
+    expect(mockConfirm).not.toHaveBeenCalled();
+    expect(mockDb.payments).toHaveLength(1);
+    expect(dbPlan()).toMatchObject({ status: 'PAST_DUE', is_active: 'Y' });
+    expect(mockDb.notifications).toHaveLength(0);
+  });
+
+  it('어제 거절 전이된 PAST_DUE 는 재시도한다 (거절이면 해지)', async () => {
+    mockDb.plans[0].status = 'PAST_DUE';
+    mockDb.payments.push(declinedRow(2, 21));
+    mockConfirm.mockRejectedValue(new DanalApiError('CARD_LIMIT', '한도 초과'));
+
+    const r = await run({ plan: { status: 'PAST_DUE' }, onFail: 'CANCELED' });
+
+    expect(r).toBe('declined');
+    expect(mockConfirm).toHaveBeenCalledTimes(1);
+    expect(dbPlan()).toMatchObject({ status: 'CANCELED', is_active: 'N' });
+  });
+
+  it('결제 행이 없는 비활성 카드로 오늘 PAST_DUE 가 된 구독은 오늘 다시 전이(해지)하지 않는다 (구독 갱신 시각)', async () => {
+    mockDb.plans[0].status = 'PAST_DUE';
+    mockDb.plans[0].updated_at = new Date(2026, 10, 3, 9, 0, 0);
+
+    const r = await run({ plan: { status: 'PAST_DUE', updated_at: new Date(2026, 10, 3, 9, 0, 0) }, billing: { is_active: 'N' }, onFail: 'CANCELED' });
+
+    expect(r).toBe('skipped');
+    expect(dbPlan()).toMatchObject({ status: 'PAST_DUE', is_active: 'Y' });
+    expect(mockDb.notifications).toHaveLength(0);
+  });
+
+  it('비활성 카드로 어제 PAST_DUE 가 된 구독은 재시도 잡에서 해지된다', async () => {
+    mockDb.plans[0].status = 'PAST_DUE';
+    mockDb.plans[0].updated_at = new Date(2026, 10, 2, 21, 0, 0);
+
+    const r = await run({ plan: { status: 'PAST_DUE', updated_at: new Date(2026, 10, 2, 21, 0, 0) }, billing: { is_active: 'N' }, onFail: 'CANCELED' });
+
+    expect(r).toBe('failed');
+    expect(dbPlan()).toMatchObject({ status: 'CANCELED', is_active: 'N' });
+  });
+
+  it('오늘 시스템 오류(ABORTED+SYSTEM_ERROR)만 새로 생겼고 거절 전이는 어제인 PAST_DUE 는 다시 청구한다', async () => {
+    mockDb.plans[0].status = 'PAST_DUE';
+    mockDb.payments.push(declinedRow(2, 21), row(`${K}_2`, 'ABORTED', { fail_code: 'SYSTEM_ERROR', updated_at: new Date(2026, 10, 3, 9, 0, 0) }));
+    okConfirm();
+
+    const r = await run({ plan: { status: 'PAST_DUE', updated_at: new Date(2026, 10, 3, 9, 0, 0) }, onFail: 'CANCELED' });
+
+    expect(r).toBe('charged');
+    expect(mockConfirm).toHaveBeenCalledTimes(1);
+  });
+
+  it('ACTIVE 구독에는 적용하지 않는다 (오늘 첫 청구)', async () => {
+    mockDb.plans[0].updated_at = new Date(2026, 10, 3, 9, 0, 0);
+    okConfirm();
+    expect(await run({ plan: { updated_at: new Date(2026, 10, 3, 9, 0, 0) } })).toBe('charged');
+  });
+});
+
 describe('[T5] 다날이 거절(DanalApiError) → ABORTED + 구독 상태 전이', () => {
   beforeEach(() => mockConfirm.mockRejectedValue(new DanalApiError('CARD_LIMIT', '한도 초과')));
 
   it('1차 잡: 선점 행을 ABORTED(fail_code=err.code) 로 갱신하고 PAST_DUE. 별도 _fail_ 행은 만들지 않는다', async () => {
     const r = await run({ onFail: 'PAST_DUE' });
 
-    expect(r).toBe('failed');
+    expect(r).toBe('declined');
     expect(mockConfirm).toHaveBeenCalledTimes(1);
     expect(mockDb.payments).toHaveLength(1);
     expect(mockDb.payments[0]).toMatchObject({ order_id: `${K}_1`, status: 'ABORTED', fail_code: 'CARD_LIMIT', fail_reason: '한도 초과' });
@@ -531,7 +665,7 @@ describe('[T5] 다날이 거절(DanalApiError) → ABORTED + 구독 상태 전�
 
     const r = await run({ plan: { status: 'PAST_DUE' }, onFail: 'CANCELED' });
 
-    expect(r).toBe('failed');
+    expect(r).toBe('declined');
     expect(dbPlan()).toMatchObject({ status: 'CANCELED', is_active: 'N', next_charge_dt: null });
     expect(dbPlan().canceled_at).toBeInstanceOf(Date);
     expect(mockDb.payments[0]).toMatchObject({ status: 'ABORTED', fail_code: 'CARD_LIMIT' });
@@ -544,7 +678,7 @@ describe('[T5] 다날이 거절(DanalApiError) → ABORTED + 구독 상태 전�
       throw new DanalApiError('CARD_LIMIT', '한도 초과');
     });
 
-    expect(await run({ onFail: 'PAST_DUE' })).toBe('failed');
+    expect(await run({ onFail: 'PAST_DUE' })).toBe('declined');
 
     expect(dbPlan()).toMatchObject({ status: 'CANCELED', is_active: 'N', next_charge_dt: null });
     expect(mockDb.payments[0]).toMatchObject({ status: 'ABORTED', fail_code: 'CARD_LIMIT' }); // 결제 행은 닫는다
@@ -1329,7 +1463,7 @@ describe('[정책4][N-4] 밀린 결제일 — 지난 주기를 한 번만 청구
 describe('[정책1] 결제 실패 → PAST_DUE → 재시도 실패 시 해지', () => {
   it('1차 실패는 PAST_DUE 이고 결제일은 그대로 남는다(재시도 잡이 같은 주기 키로 재시도)', async () => {
     mockConfirm.mockRejectedValue(new DanalApiError('CARD_LIMIT', '한도 초과'));
-    expect(await run({ onFail: 'PAST_DUE' })).toBe('failed');
+    expect(await run({ onFail: 'PAST_DUE' })).toBe('declined');
     expect(dbPlan()).toMatchObject({ status: 'PAST_DUE', is_active: 'Y', next_charge_dt: '2026-11-03' });
   });
 
@@ -1354,7 +1488,7 @@ describe('[정책1] 결제 실패 → PAST_DUE → 재시도 실패 시 해지',
     await run({ onFail: 'PAST_DUE' });
     setToday(2026, 11, 4);
 
-    expect(await run({ plan: { ...dbPlan() }, onFail: 'CANCELED' })).toBe('failed');
+    expect(await run({ plan: { ...dbPlan() }, onFail: 'CANCELED' })).toBe('declined');
 
     expect(dbPlan()).toMatchObject({ status: 'CANCELED', is_active: 'N', next_charge_dt: null });
     expect(mockConfirm).toHaveBeenCalledTimes(2);
@@ -1638,7 +1772,7 @@ describe('[알림] 구독 해지 알림 기록', () => {
     // 재시도 실패 해지도 마찬가지 — 거절 기록(ABORTED)과 해지가 유지된다
     mockDb.plans[0] = { ...planRow({ status: 'PAST_DUE' }) };
     mockConfirm.mockRejectedValue(new DanalApiError('CARD_LIMIT', '한도 초과'));
-    expect(await run({ plan: { status: 'PAST_DUE' }, onFail: 'CANCELED' })).toBe('failed');
+    expect(await run({ plan: { status: 'PAST_DUE' }, onFail: 'CANCELED' })).toBe('declined');
     expect(dbPlan().status).toBe('CANCELED');
     expect(mockDb.payments.at(-1)).toMatchObject({ status: 'ABORTED', fail_code: 'CARD_LIMIT' });
   });

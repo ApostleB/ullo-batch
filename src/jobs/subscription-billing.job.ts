@@ -80,32 +80,79 @@ export async function executeRetry(log: Log): Promise<void> {
   await processPlans(pastDue, PlanStatus.CANCELED, log);
 }
 
-type PlanResult = 'charged' | 'skipped' | 'failed' | 'unknown' | 'canceled';
+type PlanResult = 'charged' | 'skipped' | 'failed' | 'declined' | 'system_error' | 'unknown' | 'canceled';
+
+/** 다날을 실제로 호출한 결과 — 중단 판단의 표본. 건너뜀·해지·비활성 카드 전이('failed')는 다날을 호출하지 않았거나 시스템 문제라 제외한다. */
+const ATTEMPTED: readonly PlanResult[] = ['charged', 'declined', 'system_error', 'unknown'];
+/** 이상 징후로 세는 결과 — 카드 거절과 다날의 비카드 오류 */
+const SUSPICIOUS: readonly PlanResult[] = ['declined', 'system_error'];
+
+/**
+ * 잡 중단 임계 [P-1]. 한 잡에서 다날 호출 N건 중 (거절 + 비카드 오류)의 비율이 ratio 를 **넘으면** 남은 구독을 처리하지 않고 [CRITICAL] 로 중단한다.
+ * - 비율 0.5: 정상 구독 카드의 월 정기결제 거절률은 한 자릿수~십수 %다. 거절이 성공보다 많으면(>50%) 카드가 아니라 우리 쪽·다날 쪽 문제
+ *   (비밀키 교체 실수, 계약 만료, 코드 오분류)일 가능성이 압도적이다.
+ * - 최소 표본 5건: 첫 몇 건으로 판단하면 우연한 거절 몇 건에 멈춘다. 5건에서 비율을 넘으려면 거절이 3건 이상이므로,
+ *   되돌릴 수 없는 해지(재시도 잡의 거절 전이)가 이상 상황에서 난 뒤 멈추더라도 최대 3~4건에 그친다. 대상이 5건 미만인 날은 어차피 소량이다.
+ * 값은 DANAL_BILLING_ABORT_RATIO / DANAL_BILLING_ABORT_MIN_SAMPLE 로 바꾼다. 설정이 없는 환경(구 설정·테스트)도 기본값으로 동작한다.
+ */
+function abortThresholds(): { ratio: number; minSample: number } {
+  const d = config.danal as { billingAbortRatio?: number; billingAbortMinSample?: number };
+  return { ratio: d.billingAbortRatio ?? 0.5, minSample: d.billingAbortMinSample ?? 5 };
+}
 
 async function processPlans(plans: MemberPlan[], onFailStatus: OnFailStatus, log: Log): Promise<void> {
   const count: Record<PlanResult | 'error', number> = {
     charged: 0,
     skipped: 0,
     failed: 0,
+    declined: 0,
+    system_error: 0,
     unknown: 0,
     canceled: 0,
     error: 0,
   };
+  const threshold = abortThresholds();
+  let attempted = 0;
+  let suspicious = 0;
+  let aborted = false;
+  let processed = 0;
   for (const plan of plans) {
+    processed += 1;
     try {
-      count[await processOne(plan, onFailStatus, log)] += 1;
+      const result = await processOne(plan, onFailStatus, log);
+      count[result] += 1;
+      if (ATTEMPTED.includes(result)) attempted += 1;
+      if (SUSPICIOUS.includes(result)) suspicious += 1;
     } catch (err) {
       count.error += 1;
       log.error(`구독 처리 오류 plan=${plan.member_plan_id}`, {
         error: err instanceof Error ? err.message : String(err),
       });
     }
+    if (attempted >= threshold.minSample && suspicious / attempted > threshold.ratio) {
+      aborted = true;
+      break;
+    }
   }
+  // 요약의 '실패'는 카드 거절과 그 밖의 확실한 실패를 합친 값이다(기존 형식 유지). 다날 비카드 오류는 아래에 별도로 알린다.
   log.info(
-    `처리 결과: 성공 ${count.charged}, 건너뜀 ${count.skipped}, 실패 ${count.failed}, 결과 불명 ${count.unknown}, 해지 ${count.canceled}, 오류 ${count.error}건`,
+    `처리 결과: 성공 ${count.charged}, 건너뜀 ${count.skipped}, 실패 ${count.failed + count.declined}, 결과 불명 ${count.unknown}, 해지 ${count.canceled}, 오류 ${count.error}건`,
   );
+  if (count.system_error > 0) {
+    log.error(
+      `[CRITICAL] 다날이 카드 거절이 아닌 오류를 돌려준 건 ${count.system_error}건 — 구독 상태는 바꾸지 않았고 다음 실행에서 다시 청구합니다. 다날 키·계약·요청 형식을 확인하세요.`,
+    );
+  }
   if (count.unknown > 0) {
     log.error(`[CRITICAL] 결과 불명 ${count.unknown}건 — 다날 관리자 화면 확인 후 어드민에서 해소해야 합니다.`);
+  }
+  if (aborted) {
+    const message =
+      `[CRITICAL] 다날 호출 ${attempted}건 중 카드 거절 ${count.declined}건·다날 비카드 오류 ${count.system_error}건으로 비율 ` +
+      `${(suspicious / attempted).toFixed(2)} 가 임계 ${threshold.ratio} 를 넘어 청구를 중단합니다. ` +
+      `남은 ${plans.length - processed}건은 건드리지 않았습니다. 원인(다날 키·계약·응답 형식)을 확인한 뒤 다시 실행하세요.`;
+    log.error(message);
+    throw new Error(message);
   }
 }
 

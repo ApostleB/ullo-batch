@@ -1,6 +1,6 @@
 import { AppDataSource } from '../db/data-source';
 import { config } from '../config';
-import { addDays, today, ymd } from '../utils/date.util';
+import { addDays, formatLocalDateTime, today, ymd } from '../utils/date.util';
 import { getTestMemberId } from '../utils/test-options';
 import { createJobLogger } from '../logger';
 import { buildCreditExpiryMessage, creditExpiryLink, daysBetween } from '../utils/credit-expiry-notice.util';
@@ -24,6 +24,8 @@ interface Candidate {
  * - 평소(매일 실행)에는 만료일이 정확히 오늘 + 15일인 묶음만 새로 걸린다(나머지는 이미 안내해 건너뛴다).
  * - 배치가 못 돈 날 D-15 를 지나쳤어도 D-14 ~ D-1 사이에서 아직 안내하지 않은 묶음을 1회 안내한다.
  * - 구독이 활성이거나 쿠폰·일회성 크레딧, 탈퇴 회원, 잔여 0 인 lot 은 대상이 아니다.
+ * - 활성 정지 회원은 대상이 아니다(로그인할 수 없어 "만료 전에 이용" 안내가 의미 없다). 조건은 백엔드 MemberSuspensionHelper 와 같다:
+ *   released_at IS NULL AND (end_at IS NULL OR end_at > 지금). 지금 = 로컬 시각 문자열($3, --member 가 있으면 $4).
  */
 const CANDIDATE_SQL = (memberScoped: boolean) => `
   SELECT mc.member_id AS member_id,
@@ -40,6 +42,10 @@ const CANDIDATE_SQL = (memberScoped: boolean) => `
      AND m.is_del = 'N'
      AND mc.end_dt >= $1::date
      AND mc.end_dt <= $2::date
+     AND NOT EXISTS (
+       SELECT 1 FROM member_suspension ms
+        WHERE ms.member_id = mc.member_id AND ms.released_at IS NULL AND (ms.end_at IS NULL OR ms.end_at > ${memberScoped ? '$4' : '$3'})
+     )
      ${memberScoped ? 'AND mc.member_id = $3' : ''}
    GROUP BY mc.member_id, mc.end_dt
    ORDER BY mc.member_id, mc.end_dt`;
@@ -75,7 +81,8 @@ export async function execute(log: Log): Promise<void> {
   const to = ymd(addDays(base, NOTICE_DAYS_BEFORE));
   const only = getTestMemberId();
 
-  const rows: Candidate[] = await AppDataSource.query(CANDIDATE_SQL(!!only), only ? [from, to, only] : [from, to]);
+  const nowAt = formatLocalDateTime(new Date()); // 활성 정지 판단 시각 — 프로세스 로컬 시각(백엔드와 같은 방식)
+  const rows: Candidate[] = await AppDataSource.query(CANDIDATE_SQL(!!only), only ? [from, to, only, nowAt] : [from, to, nowAt]);
   log.info(`크레딧 만료 안내 후보: ${rows.length}건 (만료일 ${from} ~ ${to})`);
 
   const count: Record<Result | 'error', number> = { sent: 0, skipped: 0, failed: 0, error: 0 };

@@ -52,11 +52,17 @@ class FakeDb {
   /** 후보 조회 — SQL 조건(SUBSCRIPTION 지급분·해지된 구독·미탈퇴·잔여>0·만료일 범위·회원 한정)을 흉내 낸다 */
   async query(sql: string, params: any[]) {
     this.queries.push({ sql, params });
-    const [from, to, only] = params as [string, string, string | undefined];
+    // 회원 한정(--member)이 있으면 $3 이 회원, 없으면 $3 이 활성 정지 판단 시각이다
+    const scoped = sql.includes('mc.member_id = $3');
+    const [from, to, third, fourth] = params as [string, string, string, string | undefined];
+    const only = scoped ? third : undefined;
+    const suspensionAt = scoped ? fourth : third; // 'YYYY-MM-DD HH:mm:ss' 로컬 시각 — 활성 정지 판단 기준
+    void suspensionAt;
     const groups = new Map<string, Row>();
     for (const l of this.lots) {
       if (l.credit_type !== 'SUBSCRIPTION' || l.is_del !== 'N' || !(l.credit > 0)) continue;
       if (l.plan_status !== 'CANCELED' || l.plan_is_del !== 'N' || l.member_is_del !== 'N') continue;
+      if (l.member_suspended) continue; // NOT EXISTS (활성 정지) — 정지 회원은 로그인할 수 없어 안내 대상이 아니다
       if (l.end_dt < from || l.end_dt > to) continue;
       if (only && l.member_id !== only) continue;
       const k = `${l.member_id}|${l.end_dt}`;
@@ -195,7 +201,32 @@ describe('후보 조회 SQL (가짜 DB 는 SQL 을 실행하지 않으므로 핵
     expect(sql).toContain("m.is_del = 'N'");
     expect(sql).toContain('mc.credit > 0');
     expect(sql).toContain("to_char(mc.end_dt, 'YYYY-MM-DD')");
-    expect(sql).not.toContain('$3'); // --member 가 없으면 회원 한정 조건이 없다
+    expect(sql).not.toContain('mc.member_id = $3'); // --member 가 없으면 회원 한정 조건이 없다
+  });
+
+  it('[참고] 활성 정지 회원을 빼는 조건(백엔드 MemberSuspensionHelper 와 같은 released_at IS NULL AND (end_at IS NULL OR end_at > 지금))을 쓴다', async () => {
+    await execute(log);
+    const { sql, params } = mockDb.queries[0];
+    expect(sql).toMatch(/NOT EXISTS\s*\(\s*SELECT 1 FROM member_suspension ms/);
+    expect(sql).toContain('ms.member_id = mc.member_id');
+    expect(sql).toContain('ms.released_at IS NULL');
+    expect(sql).toMatch(/ms\.end_at IS NULL OR ms\.end_at > \$3/);
+    expect(params[2]).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/); // 로컬 시각 문자열
+  });
+});
+
+describe('활성 정지 회원 제외 [참고]', () => {
+  it('활성 정지 회원의 해지 구독 크레딧은 안내하지 않고, 정지가 아닌 회원은 안내한다', async () => {
+    mockDb.lots = [lot({ member_id: 'm-suspended', member_suspended: true }), lot({ member_id: 'm-ok' })];
+    await execute(log);
+    expect(mockDb.notifications.map((n) => n.member_id)).toEqual(['m-ok']);
+  });
+
+  it('--member 로 한정해도 정지 회원이면 안내하지 않는다', async () => {
+    setTestOptions({ memberId: 'm-suspended' });
+    mockDb.lots = [lot({ member_id: 'm-suspended', member_suspended: true })];
+    await execute(log);
+    expect(mockDb.notifications).toHaveLength(0);
   });
 });
 
