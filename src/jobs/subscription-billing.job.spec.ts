@@ -8,7 +8,7 @@ const mockConfig = {
   env: 'local',
   danal: { secretKey: 'fake-secret', merchantId: 'fake-merchant', apiBaseUrl: 'https://danal.test', batchEnabled: true },
   billing: { encKey: '' },
-  toss: { secretKey: '', baseUrl: 'https://toss.test' },
+  toss: { secretKey: 'fake-toss', baseUrl: 'https://toss.test' },
 };
 jest.mock('../config', () => ({ config: mockConfig }));
 
@@ -25,14 +25,12 @@ jest.mock('./subscription-billing.danal', () => ({
   chargeDanalPlan: (...a: unknown[]) => mockChargeDanalPlan(...a),
 }));
 
-const mockChargeBilling = jest.fn();
-jest.mock('../utils/toss-billing.client', () => ({ chargeBilling: (...a: unknown[]) => mockChargeBilling(...a) }));
-
 import { MemberPlan } from '../entities/member-plan.entity';
 import { MemberBilling } from '../entities/member-billing.entity';
 import { Plan } from '../entities/plan.entity';
 import { Payment } from '../entities/payment.entity';
 import { executePrimary, executeRetry } from './subscription-billing.job';
+import { today, ymd } from '../utils/date.util';
 
 const log: any = { info: jest.fn(), warn: jest.fn(), error: jest.fn() };
 
@@ -82,7 +80,6 @@ beforeEach(() => {
   });
   mockTransaction.mockImplementation(async (cb: (m: unknown) => unknown) => cb(manager));
   mockChargeDanalPlan.mockResolvedValue('charged');
-  mockChargeBilling.mockResolvedValue({ paymentKey: 'toss-pk', method: '카드', lastTransactionKey: 'toss-tx' });
 });
 
 describe('운영 게이트 (DANAL_BILLING_BATCH_ENABLED)', () => {
@@ -101,7 +98,6 @@ describe('운영 게이트 (DANAL_BILLING_BATCH_ENABLED)', () => {
     expect(mockQuery).not.toHaveBeenCalled();
     expect(mockTransaction).not.toHaveBeenCalled();
     expect(mockChargeDanalPlan).not.toHaveBeenCalled();
-    expect(mockChargeBilling).not.toHaveBeenCalled();
     expect(log.info).toHaveBeenCalledWith(expect.stringContaining('DANAL_BILLING_BATCH_ENABLED'));
   });
 
@@ -127,7 +123,6 @@ describe('provider 분기', () => {
     await executePrimary(log);
 
     expect(mockChargeDanalPlan).toHaveBeenCalledTimes(1);
-    expect(mockChargeBilling).not.toHaveBeenCalled(); // 회귀: DANAL 이 토스 경로로 흘러가지 않는다
     expect(mockTransaction).not.toHaveBeenCalled();
   });
 
@@ -152,35 +147,55 @@ describe('provider 분기', () => {
     await executePrimary(log);
 
     expect(mockChargeDanalPlan).not.toHaveBeenCalled();
-    expect(mockChargeBilling).not.toHaveBeenCalled();
     expect(mockTransaction).not.toHaveBeenCalled(); // payment 삽입·구독 갱신 없음
     expect(manager.save).not.toHaveBeenCalled();
     expect(manager.update).not.toHaveBeenCalled();
     expect(summary()).toContain('재등록 필요 2건');
   });
 
+  // PG 전환 원칙 — 이전 PG(이니시스·토스·provider NULL) 카드는 처리하지 않고 건너뛴다.
+  // 구독을 PAST_DUE/SUSPENDED 로 바꾸거나 실패 행을 쌓지 않는다. 게이트를 켜도 토스로 새지 않는다 [H-2].
   it.each([
     ['NULL', null],
     ['TOSS', 'TOSS'],
-  ])('%s → 기존 토스 경로', async (_name, provider) => {
+    ['toss(소문자)', 'toss'],
+    ['빈 문자열', ''],
+    ['알 수 없는 값', 'KCP'],
+  ])('%s → 건너뜀: 청구·상태·결제 행 변경이 없다 (H-2)', async (_name, provider) => {
     plans = [planRow('mp1', 'b1')];
     billings.b1 = billing('b1', provider);
 
     await executePrimary(log);
+    await executeRetry(log);
 
-    expect(mockChargeBilling).toHaveBeenCalledTimes(1);
-    expect(mockChargeBilling.mock.calls[0][0]).toMatchObject({ billingKey: 'fake-billing-key', amount: 9900 });
     expect(mockChargeDanalPlan).not.toHaveBeenCalled();
+    expect(mockTransaction).not.toHaveBeenCalled(); // payment 삽입·구독 갱신 없음
+    expect(manager.save).not.toHaveBeenCalled();
+    expect(manager.update).not.toHaveBeenCalled();
+    expect(summary()).toContain('재등록 필요 1건');
   });
 
-  it('빌링 행이 없으면 provider 를 알 수 없어 기존 경로(결제 불가 처리)를 탄다', async () => {
-    plans = [planRow('mp1', 'missing')];
+  it('토스 시크릿 키가 있어도 NULL·TOSS 카드는 토스를 호출하지 않는다(코드 경로 자체가 없다)', () => {
+    const src = require('fs').readFileSync(require.resolve('./subscription-billing.job'), 'utf8') as string;
+    expect(src).not.toContain('toss-billing.client');
+    expect(src).not.toContain('chargeBilling');
+    expect(src).not.toContain('markFailed');
+  });
+
+  it.each([
+    ['member_billing_id 가 없음', null],
+    ['카드 행이 삭제됨/없음', 'missing'],
+  ])('카드 정보 없음(%s) → 건너뜀: 실패 행·상태 전이 없이 재등록 필요로 센다', async (_name, billingId) => {
+    plans = [{ ...planRow('mp1', 'x'), member_billing_id: billingId }];
 
     await executePrimary(log);
+    await executeRetry(log);
 
     expect(mockChargeDanalPlan).not.toHaveBeenCalled();
-    expect(mockChargeBilling).not.toHaveBeenCalled();
-    expect(mockTransaction).toHaveBeenCalledTimes(1); // markFailed
+    expect(mockTransaction).not.toHaveBeenCalled();
+    expect(manager.save).not.toHaveBeenCalled();
+    expect(manager.update).not.toHaveBeenCalled();
+    expect(summary()).toContain('재등록 필요 1건');
   });
 
   it('이니시스 호출 경로는 더 이상 없다', async () => {
@@ -235,13 +250,15 @@ describe('요약 로그', () => {
 
 // 07-subscription-review M-9 — 어드민이 비활성화(is_active=N)한 PAST_DUE 구독은 재시도 잡이 청구·복구하지 않는다
 describe('[M-9] 재시도 잡 조회 조건', () => {
-  it('PAST_DUE 중 is_active=Y, is_del=N, next_charge_dt 가 있는 구독만 조회한다', async () => {
+  it('PAST_DUE 중 is_active=Y, is_del=N, 결제일이 도래한(<= 오늘) 구독만 조회한다', async () => {
     await executeRetry(log);
 
     expect(memberPlanRepo.find).toHaveBeenCalledTimes(1);
     const { where } = memberPlanRepo.find.mock.calls[0][0];
     expect(where).toMatchObject({ is_del: 'N', is_active: 'Y', status: 'PAST_DUE' });
-    expect(where.next_charge_dt).toBeDefined(); // Not(IsNull())
+    // [M-2] 결제일이 아직 오지 않은 PAST_DUE 를 미리 청구하지 않는다. NULL 은 <= 비교에서 자동 제외된다.
+    expect(where.next_charge_dt.type).toBe('lessThanOrEqual');
+    expect(ymd(where.next_charge_dt.value)).toBe(ymd(today()));
   });
 });
 

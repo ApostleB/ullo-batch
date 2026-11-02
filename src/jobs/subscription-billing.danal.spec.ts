@@ -242,7 +242,31 @@ const row = (orderId: string, status: string, over: Row = {}): Row => ({
   ...over,
 });
 
+// 날짜는 가짜 시계로 고정한다 — 픽스처 결제일(2026-11-03)이 "오늘"이 되게 해서 실제 날짜와 무관하게 같은 결과가 나온다.
+// Date 만 가짜로 두고 타이머·마이크로태스크는 진짜를 쓴다(인메모리 DB 의 Promise 체인이 그대로 돈다).
+const FAKE_NOW = new Date(2026, 10, 3, 21, 0, 0);
+const setToday = (y: number, m: number, d: number) => jest.setSystemTime(new Date(y, m - 1, d, 21, 0, 0));
+
 beforeEach(() => {
+  jest.useFakeTimers({
+    now: FAKE_NOW,
+    doNotFake: [
+      'hrtime',
+      'nextTick',
+      'performance',
+      'queueMicrotask',
+      'requestAnimationFrame',
+      'cancelAnimationFrame',
+      'requestIdleCallback',
+      'cancelIdleCallback',
+      'setImmediate',
+      'clearImmediate',
+      'setInterval',
+      'clearInterval',
+      'setTimeout',
+      'clearTimeout',
+    ],
+  });
   jest.clearAllMocks();
   mockDb.payments = [];
   mockDb.plans = [];
@@ -258,6 +282,10 @@ beforeEach(() => {
   mockConfig.danal.merchantId = 'fake-merchant';
   mockConfig.billing.encKey = ENC_SECRET;
   seed();
+});
+
+afterEach(() => {
+  jest.useRealTimers();
 });
 
 // ====================================================================
@@ -278,12 +306,34 @@ describe('[T1] 주기에 DONE 이 있으면 청구 없이 결제일만 전진', 
     expect(dbPlan().status).toBe('ACTIVE');
   });
 
-  it('PAST_DUE 였던 구독도 DONE 이 있으면 ACTIVE 로 돌아오며 결제일이 전진한다', async () => {
+  it('PAST_DUE 였던 구독도 DONE 이 있으면 ACTIVE 로 돌아오며 결제일이 전진한다 (백엔드 재청구와 같은 동작) [M-2]', async () => {
     mockDb.plans[0].status = 'PAST_DUE';
     mockDb.payments.push(row(`${K}_1`, 'DONE'));
     await run({ plan: { status: 'PAST_DUE' }, onFail: 'SUSPENDED' });
     expect(dbPlan().status).toBe('ACTIVE');
     expect(ymd(dbPlan().next_charge_dt)).toBe('2026-12-03');
+  });
+
+  it('결제일(과 이용기간)만 전진하고 플랜 전환·예약 해제·고정가 갱신은 하지 않는다 — 어느 플랜으로 결제됐는지 모른다 [M-2]', async () => {
+    mockDb.masters.push({ plan_id: 'p2', plan_title: '프리미엄', actual_amount: 19900, credit: 30, is_del: 'N', is_active: 'Y', plan_type: 'SUBSCRIPTION' });
+    Object.assign(dbPlan(), { pending_plan_id: 'p2' });
+    mockDb.payments.push(row(`${K}_1`, 'DONE'));
+
+    const r = await run({ plan: { pending_plan_id: 'p2' } });
+
+    expect(r).toBe('skipped');
+    expect(dbPlan()).toMatchObject({ plan_id: 'p1', pending_plan_id: 'p2', locked_amount: 9900, locked_credit: 10 });
+    expect(ymd(dbPlan().next_charge_dt)).toBe('2026-12-03');
+  });
+
+  it('밀린 주기에 DONE 이 있어도 결제일은 오늘 이후로 재설정한다(한 달씩만 전진해 과거에 남지 않는다) [C-1]', async () => {
+    Object.assign(dbPlan(), { next_charge_dt: '2026-08-15' });
+    mockDb.payments.push(row('sub_mp1_202608_1', 'DONE'));
+
+    await run({ plan: { next_charge_dt: '2026-08-15' } });
+
+    expect(mockConfirm).not.toHaveBeenCalled();
+    expect(ymd(dbPlan().next_charge_dt)).toBe('2026-11-15');
   });
 });
 
@@ -381,6 +431,7 @@ describe('[T4] 승인 성공 + 대조 일치 → 지급', () => {
 
   it('주기 마지막 날 앵커는 월말로 클램프된다 (1/31 → 2/28)', async () => {
     mockDb.plans[0].next_charge_dt = '2027-01-31';
+    setToday(2027, 1, 31);
     okConfirm();
     await run({ plan: { next_charge_dt: '2027-01-31' } });
     expect(ymd(dbPlan().next_charge_dt)).toBe('2027-02-28');
@@ -704,7 +755,7 @@ describe('결정 4 — 취소 성공한 시스템 오류가 같은 주기에 있
 
 describe('금액·크레딧', () => {
   it('pending_plan_id 가 있으면 새 플랜가·새 플랜 크레딧으로 청구하고 플랜을 전환한다', async () => {
-    mockDb.masters.push({ plan_id: 'p2', plan_title: '프리미엄', actual_amount: 19900, credit: 30, is_del: 'N' });
+    mockDb.masters.push({ plan_id: 'p2', plan_title: '프리미엄', actual_amount: 19900, credit: 30, is_del: 'N', is_active: 'Y', plan_type: 'SUBSCRIPTION' });
     mockDb.plans[0].pending_plan_id = 'p2';
     okConfirm();
 
@@ -835,6 +886,7 @@ describe('기록 형식', () => {
 
   it('주기 키는 next_charge_dt 문자열로 만든다(타임존 하루 밀림 없음)', async () => {
     mockDb.plans[0].next_charge_dt = '2026-12-01';
+    setToday(2026, 12, 1); // 결제일이 도래해야 청구된다
     okConfirm();
     await run({ plan: { next_charge_dt: '2026-12-01' } });
     expect(mockConfirm.mock.calls[0][0].orderId).toBe('sub_mp1_202612_1');
@@ -992,5 +1044,142 @@ describe('[H-3] 선점 트랜잭션에서 회원 탈퇴(is_del)를 확인한다'
     expect(await run({ plan: { status: 'PAST_DUE' }, onFail: 'SUSPENDED' })).toBe('skipped');
     expect(mockConfirm).not.toHaveBeenCalled();
     expect(dbPlan().status).toBe('PAST_DUE');
+  });
+});
+
+// ====================================================================
+// 정책: 밀린 결제일(C-1) — 개발 단계에서는 지난 주기를 청구하지 않는다.
+// 이용기간(결제일~결제일+1개월)이 끝난 주기는 건너뛰고, 다음 결제일만 오늘 이후로 옮겨 그 주기부터 정상 청구한다.
+describe('[C-1] 밀린 결제일 — 지난 주기를 청구하지 않고 다음 결제일만 오늘 이후로 재설정한다', () => {
+  const overdue = (over: Row = {}): Row => ({ next_charge_dt: '2026-08-15', ...over });
+  /** 잡이 매번 DB 에서 다시 읽는 것을 흉내 낸다 */
+  const runFromDb = (onFail: OnFailStatus = 'PAST_DUE') => run({ plan: { ...dbPlan() }, onFail });
+
+  it('리뷰 재현: 3개월 밀린 ACTIVE 구독 — 3일 연속 실행해도 청구 0회, 결제일은 2026-11-15 로 한 번만 옮겨진다', async () => {
+    Object.assign(dbPlan(), overdue());
+    okConfirm();
+
+    for (const day of [3, 4, 5]) {
+      setToday(2026, 11, day);
+      expect(await runFromDb()).toBe('skipped');
+    }
+
+    expect(mockConfirm).not.toHaveBeenCalled();
+    expect(mockDb.payments).toHaveLength(0); // 결제 행(실패 행 포함)을 만들지 않는다
+    expect(mockDb.credits).toHaveLength(0);
+    expect(ymd(dbPlan().next_charge_dt)).toBe('2026-11-15');
+    expect(dbPlan()).toMatchObject({ status: 'ACTIVE', is_active: 'Y', canceled_at: null, plan_id: 'p1' });
+  });
+
+  it('재설정된 결제일(2026-11-15)이 오면 그 주기부터 정상 청구되고 다음 결제일은 12-15', async () => {
+    Object.assign(dbPlan(), overdue());
+    await runFromDb(); // 11-03: 재설정
+    okConfirm();
+    setToday(2026, 11, 15);
+
+    expect(await runFromDb()).toBe('charged');
+
+    expect(mockConfirm).toHaveBeenCalledTimes(1);
+    expect(mockDb.payments[0]).toMatchObject({ order_id: 'sub_mp1_202611_1', status: 'DONE' });
+    expect(ymd(dbPlan().next_charge_dt)).toBe('2026-12-15');
+  });
+
+  it('이용기간(이 주기 + 1개월)이 오늘이면 끝난 주기 — 청구하지 않고 12-03 으로 옮긴다', async () => {
+    Object.assign(dbPlan(), overdue({ next_charge_dt: '2026-10-03' }));
+    expect(await runFromDb()).toBe('skipped');
+    expect(mockConfirm).not.toHaveBeenCalled();
+    expect(ymd(dbPlan().next_charge_dt)).toBe('2026-12-03');
+  });
+
+  it('이용기간이 내일까지인 주기(10-04)는 진행 중이라 청구하고, 다음 결제일은 오늘 이후(11-04)다', async () => {
+    Object.assign(dbPlan(), overdue({ next_charge_dt: '2026-10-04' }));
+    okConfirm();
+
+    expect(await runFromDb()).toBe('charged');
+
+    expect(mockConfirm).toHaveBeenCalledTimes(1);
+    expect(mockDb.payments[0].order_id).toBe('sub_mp1_202610_1');
+    expect(ymd(dbPlan().next_charge_dt)).toBe('2026-11-04');
+  });
+
+  it('재시도 잡(PAST_DUE)이 밀린 구독을 만나면 청구·실패 행·SUSPENDED 없이 ACTIVE 로 돌려 새 결제일부터 청구한다', async () => {
+    Object.assign(dbPlan(), overdue({ status: 'PAST_DUE' }));
+
+    expect(await runFromDb('SUSPENDED')).toBe('skipped');
+
+    expect(mockConfirm).not.toHaveBeenCalled();
+    expect(mockDb.payments).toHaveLength(0);
+    expect(dbPlan()).toMatchObject({ status: 'ACTIVE', is_active: 'Y', canceled_at: null });
+    expect(ymd(dbPlan().next_charge_dt)).toBe('2026-11-15');
+  });
+
+  it('이용기간(end_dt)은 연장하지 않는다 — 결제 없이 기간을 늘리지 않는다', async () => {
+    Object.assign(dbPlan(), overdue({ end_dt: '2026-08-15' }));
+    await runFromDb();
+    expect(String(dbPlan().end_dt).slice(0, 10)).toBe('2026-08-15');
+  });
+
+  it('밀린 주기에 CONFIRMING(결과 불명)이 있으면 재설정하지 않는다 — 어드민 GRANT 해소가 주기 키를 맞춰야 한다', async () => {
+    Object.assign(dbPlan(), overdue());
+    mockDb.payments.push(row('sub_mp1_202608_1', 'CONFIRMING', { fail_code: 'CONFIRM_UNKNOWN' }));
+    const before = JSON.stringify(mockDb.plans);
+
+    expect(await runFromDb()).toBe('skipped');
+
+    expect(JSON.stringify(mockDb.plans)).toBe(before);
+    expect(mockConfirm).not.toHaveBeenCalled();
+  });
+
+  it('조회 뒤 회원이 해지했다면 재설정으로 되살리지 않는다 (H-1 과 함께)', async () => {
+    const snapshot = { ...planInDb, ...overdue() };
+    Object.assign(dbPlan(), overdue(), { status: 'CANCELED', is_active: 'N', next_charge_dt: null });
+
+    await run({ plan: snapshot });
+
+    expect(dbPlan()).toMatchObject({ status: 'CANCELED', is_active: 'N', next_charge_dt: null });
+  });
+
+  it('결제일이 아직 오지 않은 구독은 청구하지 않는다 — 재시도 잡이 12월분을 미리 청구하던 문제 [M-2]', async () => {
+    Object.assign(dbPlan(), { status: 'PAST_DUE', next_charge_dt: '2026-11-04' });
+    const before = JSON.stringify(mockDb.plans);
+
+    expect(await runFromDb('SUSPENDED')).toBe('skipped');
+
+    expect(mockConfirm).not.toHaveBeenCalled();
+    expect(mockDb.payments).toHaveLength(0);
+    expect(JSON.stringify(mockDb.plans)).toBe(before);
+  });
+
+  it('로그에 빌링키가 남지 않는다', async () => {
+    Object.assign(dbPlan(), overdue());
+    await runFromDb();
+    expect(logged()).not.toContain(PLAIN_KEY);
+  });
+});
+
+// 07-subscription-review M-3 — 예약 플랜 검증을 백엔드(loadSubscribablePlan)와 맞춘다
+describe('[M-3] 예약(pending_plan_id) 플랜 검증 — 판매 중인 구독 플랜이고 금액이 100원 이상일 때만 청구한다', () => {
+  it.each([
+    ['판매 중단(is_active=N)', { plan_type: 'SUBSCRIPTION', is_active: 'N', actual_amount: 19900 }],
+    ['구독 플랜이 아님(CREDIT_PACK)', { plan_type: 'CREDIT_PACK', is_active: 'Y', actual_amount: 19900 }],
+    ['금액 100원 미만', { plan_type: 'SUBSCRIPTION', is_active: 'Y', actual_amount: 99 }],
+  ])('%s → 청구하지 않고 구독 상태·예약·결제일을 그대로 둔다(오류 로그)', async (_name, master) => {
+    mockDb.masters.push({ plan_id: 'p2', plan_title: '예약 플랜', credit: 30, is_del: 'N', ...master });
+    Object.assign(dbPlan(), { pending_plan_id: 'p2' });
+    const before = JSON.stringify(mockDb.plans);
+
+    const r = await run({ plan: { pending_plan_id: 'p2' } });
+
+    expect(r).toBe('skipped');
+    expect(mockConfirm).not.toHaveBeenCalled();
+    expect(mockDb.payments).toHaveLength(0);
+    expect(JSON.stringify(mockDb.plans)).toBe(before);
+    expect(log.error).toHaveBeenCalled();
+  });
+
+  it('예약이 없으면 현재 플랜은 판매 중단이어도 가입 시점 고정가로 계속 청구된다(이미 구독 중인 회원)', async () => {
+    mockDb.masters[0].is_active = 'N';
+    okConfirm();
+    expect(await run()).toBe('charged');
   });
 });

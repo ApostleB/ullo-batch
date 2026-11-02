@@ -2,6 +2,7 @@
  * 구독 주기 키·청구 시도 번호 — 백엔드 src/payment/subscription-cycle.util.ts 와 같은 내용(복제).
  * ⚠️ 포맷·규칙을 바꾸면 백엔드와 반드시 함께 수정한다(어긋나면 이중 청구/누락). 표는 spec 이 같다.
  */
+import { addMonthsClamped, parseLocalDate } from './date.util';
 
 /** 한 주기 안에서 허용하는 최대 청구 시도 번호 (백엔드 MAX_CHARGE_ATTEMPT) */
 export const MAX_CHARGE_ATTEMPT = 9;
@@ -54,4 +55,30 @@ export function classifyCycle(
 /** `LIKE ... ESCAPE '\'` 용 패턴 — `{escaped key}\_%` */
 export function cycleLikePattern(key: string): string {
   return `${key.replace(/[\\%_]/g, (c) => `\\${c}`)}\\_%`;
+}
+
+/**
+ * 밀린 결제일 정책(개발 단계 결정 — 백엔드 subscription-cycle.util.ts 와 같은 규칙):
+ * 주기의 이용기간(결제일 ~ 결제일+1개월)이 이미 끝났다면 그 지난 주기는 청구하지 않는다.
+ * 다음 결제일만 오늘 이후로 옮기고 그 주기부터 정상 청구한다. 진행 중인 주기(어제 실패해 재시도하는 건 포함)는 청구한다.
+ * @param cycleYmd 청구하려는 주기의 결제일('YYYY-MM-DD')
+ * @param todayLocal 오늘 로컬 자정
+ */
+export function isCyclePeriodEnded(cycleYmd: string, todayLocal: Date): boolean {
+  return addMonthsClamped(parseLocalDate(cycleYmd), 1).getTime() <= todayLocal.getTime();
+}
+
+/**
+ * 주기 결제일 기준 앵커(일자)를 유지하며 오늘보다 뒤인 가장 이른 결제일.
+ * `cycle + n개월`(n≥1) 중에서 고른다 — 월말 클램프가 누적(1/31→2/28→3/28)되지 않도록 항상 원래 결제일에서 계산한다.
+ */
+export function nextChargeDateAfter(cycleYmd: string, todayLocal: Date): Date {
+  const base = parseLocalDate(cycleYmd);
+  let n = 1;
+  let next = addMonthsClamped(base, n);
+  while (next.getTime() <= todayLocal.getTime()) {
+    n += 1;
+    next = addMonthsClamped(base, n);
+  }
+  return next;
 }

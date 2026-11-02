@@ -10,7 +10,14 @@ import { MemberCreditLog } from '../entities/member-credit-log.entity';
 import { ActiveStatus, IsYn, PaymentStatus, PlanStatus } from '../entities/enums';
 import { cancel, confirmBilling, DanalApiError } from '../utils/danal-billing.client';
 import { decryptBillingKey, isEncryptedBillingKey } from '../utils/billing-crypto.util';
-import { attemptOrderId, classifyCycle, cycleKey, cycleLikePattern } from '../utils/subscription-cycle.util';
+import {
+  attemptOrderId,
+  classifyCycle,
+  cycleKey,
+  cycleLikePattern,
+  isCyclePeriodEnded,
+  nextChargeDateAfter,
+} from '../utils/subscription-cycle.util';
 import { addMonthsClamped, toLocalDate, today, ymd } from '../utils/date.util';
 import { createJobLogger } from '../logger';
 
@@ -30,6 +37,8 @@ export type ChargeOutcome = 'charged' | 'skipped' | 'failed' | 'unknown';
 export type OnFailStatus = typeof PlanStatus.PAST_DUE | typeof PlanStatus.SUSPENDED;
 
 const BILLING_PROVIDER_DANAL = 'DANAL';
+/** 예약(pending_plan_id) 플랜으로 청구할 수 있는 플랜 종류 — 백엔드 loadSubscribablePlan 과 같다 */
+const SUBSCRIPTION_PLAN_TYPE = 'SUBSCRIPTION';
 /** 다날 카드 최소 결제 금액(원) */
 const MIN_CARD_AMOUNT = 100;
 /** 크레딧 유효기간(개월) — 결제일로부터 3개월 */
@@ -96,25 +105,33 @@ function staleReason(snapshot: MemberPlan, fresh: MemberPlan | null): string | n
   return null;
 }
 
-/** 멱등 케이스(T1): 이미 결제됨 → 결제일만 다음 주기로 갱신. manager 를 주면 그 트랜잭션 안에서 갱신한다. */
-export async function advancePlanOnly(
-  plan: MemberPlan,
-  effectivePlanId: string,
-  manager: EntityManager = AppDataSource.manager,
-): Promise<void> {
-  const newNextCharge = addMonthsClamped(toLocalDate(plan.next_charge_dt!), 1);
+/**
+ * 멱등 케이스(T1): 이미 결제된 주기 → 청구 없이 결제일만 다음 주기로 갱신한다(백엔드 재청구 T1 과 같은 동작).
+ * - 결제된 회원이므로 ACTIVE 로 둔다(PAST_DUE 에 남기면 다음 재시도 잡이 결제일 전에 청구하려 든다).
+ * - 어느 플랜으로 결제됐는지 알 수 없으므로 plan_id·pending_plan_id·고정가는 건드리지 않는다.
+ * - 다음 결제일은 오늘 이후로 맞춘다(밀린 결제일이 과거에 남아 연속 청구되지 않게) [C-1].
+ */
+async function advancePlanOnly(plan: MemberPlan, cycleYmd: string, manager: EntityManager): Promise<void> {
+  const next = nextChargeDateAfter(cycleYmd, today());
   await manager.update(
     MemberPlan,
     { member_plan_id: plan.member_plan_id },
-    {
-      plan_id: effectivePlanId,
-      pending_plan_id: null,
-      status: PlanStatus.ACTIVE,
-      next_charge_dt: newNextCharge,
-      end_dt: newNextCharge,
-      updated_at: new Date(),
-    },
+    { status: PlanStatus.ACTIVE, next_charge_dt: next, end_dt: next, updated_at: new Date() },
   );
+}
+
+/**
+ * 밀린 주기(이용기간이 이미 끝난 주기) 처리 [C-1] — 청구하지 않고 다음 결제일만 오늘 이후로 옮긴다.
+ * 이용기간(end_dt)은 연장하지 않는다. PAST_DUE 였다면 ACTIVE 로 돌려 새 결제일부터 정상 청구한다(실패 행·SUSPENDED 없음).
+ */
+async function reanchorPlan(plan: MemberPlan, cycleYmd: string, manager: EntityManager): Promise<Date> {
+  const next = nextChargeDateAfter(cycleYmd, today());
+  await manager.update(
+    MemberPlan,
+    { member_plan_id: plan.member_plan_id },
+    { status: PlanStatus.ACTIVE, next_charge_dt: next, updated_at: new Date() },
+  );
+  return next;
 }
 
 /** 카드가 거절된 실패(T5)의 구독 상태 전이: PAST_DUE(1차) / SUSPENDED(재시도 — 비활성·해지 시각 기록) */
@@ -155,6 +172,7 @@ function resolveBillingKey(plan: MemberPlan, billing: MemberBilling, log: Log): 
 
 type Claim =
   | { kind: 'already' }
+  | { kind: 'reanchored'; next: string }
   | { kind: 'confirming' }
   | { kind: 'exhausted' }
   | { kind: 'stale'; reason: string }
@@ -182,6 +200,11 @@ export async function chargeDanalPlan(
     log.warn(`next_charge_dt 없음 — 결제 스킵 plan=${planId}`);
     return 'skipped';
   }
+  // 결제일이 아직 오지 않은 구독은 청구하지 않는다(재시도 잡이 PAST_DUE 를 미리 청구하던 문제) [M-2]
+  if (toLocalDate(plan.next_charge_dt).getTime() > today().getTime()) {
+    log.warn(`결제일이 아직 오지 않아 청구하지 않음 plan=${planId} next_charge_dt=${toYmdString(plan.next_charge_dt)}`);
+    return 'skipped';
+  }
   // [T11] 다날 카드가 아니면 청구하지 않는다 — 재등록 후 카드 교체가 필요하다
   if ((billing.provider ?? '').toUpperCase() !== BILLING_PROVIDER_DANAL) {
     log.warn(`다날 카드가 아니라 청구하지 않음(재등록 필요) plan=${planId}`);
@@ -205,6 +228,13 @@ export async function chargeDanalPlan(
   const master = await AppDataSource.manager.findOne(Plan, { where: { plan_id: effectivePlanId, is_del: IsYn.N } });
   if (!master) {
     log.error(`[CRITICAL] 구독 플랜을 찾을 수 없어 청구하지 않음 plan=${planId} plan_id=${effectivePlanId}`);
+    return 'skipped';
+  }
+  // [M-3] 예약 플랜은 판매 중인 구독 플랜이어야 한다(백엔드 loadSubscribablePlan 과 같다). 아니면 청구하지 않고 상태를 그대로 둔다.
+  if (plan.pending_plan_id && (master.is_active !== ActiveStatus.Y || master.plan_type !== SUBSCRIPTION_PLAN_TYPE)) {
+    log.error(
+      `[CRITICAL] 예약 플랜이 판매 중인 구독 플랜이 아니라 청구하지 않음 plan=${planId} pending_plan_id=${plan.pending_plan_id} is_active=${master.is_active} plan_type=${master.plan_type}`,
+    );
     return 'skipped';
   }
   // 금액은 DB 값만 쓴다: 예약이 있으면 새 플랜 값, 없으면 가입 시점 고정값(없으면 현재가)
@@ -242,10 +272,15 @@ export async function chargeDanalPlan(
       const cycle = classifyCycle(rows, key);
       if (cycle.done) {
         // [T1] 이미 결제된 주기 — 청구 없이 결제일만 전진
-        await advancePlanOnly(plan, effectivePlanId, m);
+        await advancePlanOnly(plan, cycleYmd, m);
         return { kind: 'already' };
       }
-      if (cycle.confirming) return { kind: 'confirming' }; // [T2]
+      if (cycle.confirming) return { kind: 'confirming' }; // [T2] (결과 불명 건은 재설정하지 않는다 — 어드민 GRANT 해소가 주기 키를 맞춘다)
+      // [C-1] 이용기간이 끝난 지난 주기는 청구하지 않는다 — 다음 결제일만 오늘 이후로 옮기고 그 주기부터 청구한다
+      if (isCyclePeriodEnded(cycleYmd, today())) {
+        const next = await reanchorPlan(plan, cycleYmd, m);
+        return { kind: 'reanchored', next: ymd(next) };
+      }
       if (cycle.nextAttempt === null) return { kind: 'exhausted' }; // [T3]
       const blockedRow = rows.find(
         (r) =>
@@ -290,6 +325,9 @@ export async function chargeDanalPlan(
   switch (claim.kind) {
     case 'already':
       log.info(`이미 결제됨(멱등) key=${key} → 결제일만 갱신`);
+      return 'skipped';
+    case 'reanchored':
+      log.warn(`결제일이 밀려 지난 주기는 청구하지 않고 다음 결제일을 ${claim.next} 로 재설정함 plan=${planId} key=${key}`);
       return 'skipped';
     case 'confirming':
       log.warn(`이 주기에 결과 확인 중인 결제가 있어 건너뜀 key=${key}`);
@@ -563,7 +601,8 @@ async function applyGrant(m: EntityManager, payment: Payment, tid: string, ctx: 
     );
   }
 
-  const next = addMonthsClamped(toLocalDate(ctx.cycleYmd), 1);
+  // 오늘 이후로 맞춘다 — 정상 주기는 cycle+1개월 그대로이고, 해소(GRANT) 등으로 밀린 주기를 지급하는 경우에도 과거 결제일이 남지 않는다 [C-1]
+  const next = nextChargeDateAfter(ctx.cycleYmd, today());
   const updated = await m.update(
     MemberPlan,
     { member_plan_id: ctx.plan.member_plan_id, is_del: IsYn.N },

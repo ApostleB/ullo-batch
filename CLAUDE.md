@@ -84,10 +84,11 @@ billing 2종은 `scheduler/index.ts`에서 주석 처리되어 있으나 CLI(`np
 ### 구독 청구 (다날) — `jobs/subscription-billing.job.ts` + `jobs/subscription-billing.danal.ts`
 
 - **운영 게이트:** `DANAL_BILLING_BATCH_ENABLED` 가 정확히 `'true'` 일 때만 `executePrimary`/`executeRetry` 가 DB 를 조회하고 청구한다. 아니면 CLI 수동 실행(`npm run job billing`)도 아무것도 하지 않는다(기본 꺼짐). 스케줄러 등록은 계속 주석 처리 상태다. 다날 빌링 계약·빌링 테스트 키 확인 전에는 켜지 않는다(실연동 미검증).
-- **provider 분기**(`member_billing.provider`, 대소문자 무시): `DANAL` → 다날 / `INICIS` → 청구하지 않고 건너뜀(상태·결제 행 불변, 요약 로그 `재등록 필요 N건`) / 그 외(NULL, TOSS) → 기존 토스 경로. 이니시스 호출 경로는 없다.
+- **provider 분기**(`member_billing.provider`, 대소문자 무시): `DANAL` 만 청구한다. 그 외(INICIS·TOSS·NULL·알 수 없는 값)와 카드 정보가 없는 구독은 전부 건너뛴다(PG 전환 원칙: 이전 PG 데이터는 처리하지 않는다 — 상태(PAST_DUE/SUSPENDED)·결제 행 불변, 실패 행을 쌓지 않음, 요약 로그 `재등록 필요 N건`). 토스·이니시스 호출 경로는 없다. 사용자가 다날 카드를 새로 등록해 카드 교체 API 로 바꾸면 그때부터 청구된다.
+- **밀린 결제일(개발 단계 정책):** 주기의 이용기간(결제일 ~ 결제일+1개월)이 이미 끝난 주기는 청구하지 않는다. 다음 결제일만 오늘 이후로 옮기고(앵커 일자 유지, `nextChargeDateAfter`) 그 주기부터 정상 청구한다 — `PAST_DUE` 였다면 `ACTIVE` 로 돌리며 실패 행·`SUSPENDED` 는 만들지 않고 `end_dt` 도 연장하지 않는다. 진행 중인 주기(전날 실패해 재시도하는 건 포함)는 청구한다. 결제일이 아직 오지 않은 구독(재시도 잡의 `PAST_DUE` 포함)은 청구하지 않는다. `CONFIRMING` 이 있는 주기는 어드민 해소가 주기 키를 맞춰야 하므로 옮기지 않는다. 백엔드 `applyGrant`·어드민 재청구와 같은 규칙이다.
 - **순서:** 사전 검증 → `payment` 를 `CONFIRMING` 으로 선점(`pg_advisory_xact_lock(hashtext('subcycle:'||K))` 아래에서 주기 판정·삽입) → 트랜잭션 밖 `confirmBilling` → 응답 대조 → 지급 트랜잭션 → 실패 시 보상 `cancel(C)`. 다날 호출 전에 반드시 선점하고, 결과 불명(`DanalResultUnknownError`)은 같은 `orderId` 로 재호출하지 않는다(`CONFIRMING` 으로 남기면 어드민이 다날 관리자 화면 확인 후 해소). 동작표 T1~T13 은 백엔드 `SubscriptionChargeService`/`SubscriptionSettleService` 와 같다.
 - **주기 키·시도 번호:** `utils/subscription-cycle.util.ts` 는 백엔드 `src/payment/subscription-cycle.util.ts` 의 복제다(spec 표도 같다). 주문번호는 `sub_{member_plan_id}_{YYYYMM}_{n}`(n=1..9). 한쪽을 바꾸면 반드시 함께 바꾼다.
-- **금액:** `pending_plan_id` 가 있으면 새 플랜가·크레딧, 없으면 `locked_amount ?? plan.actual_amount`(크레딧도 `locked_credit` 규칙). 100원 미만이면 청구하지 않는다.
+- **금액:** `pending_plan_id` 가 있으면 새 플랜가·크레딧(판매 중인 `SUBSCRIPTION` 플랜일 때만 — 아니면 청구하지 않고 `[CRITICAL]`), 없으면 `locked_amount ?? plan.actual_amount`(크레딧도 `locked_credit` 규칙). 100원 미만이면 청구하지 않는다.
 - **빌링키:** `enc:v1:` 형식만 청구한다(`BILLING_KEY_ENC_KEY` 없으면 건너뜀). 평문 빌링키·비밀키는 로그·예외에 남기지 않는다.
 - **같은 주기에 `CONFIRM_MISMATCH_CANCELED`/`GRANT_FAILED_CANCELED` 인 `ABORTED` 행이 있으면** 매일 승인-취소가 반복되지 않도록 그 구독을 건너뛰고 `[CRITICAL]` 을 남긴다(어드민 재청구로 해소).
 
@@ -96,7 +97,7 @@ billing 2종은 `scheduler/index.ts`에서 주석 처리되어 있으나 CLI(`np
 - **date 컬럼 UTC off-by-one**: TypeORM의 `date` 타입은 런타임에 `'YYYY-MM-DD'` 문자열로 온다. `new Date('YYYY-MM-DD')`는 UTC 자정으로 파싱되어 음수 오프셋(KST)에서 하루가 어긋난다. 날짜 비교/포맷 전에 반드시 `toLocalDate()`(문자열/Date 모두 로컬 자정으로 정규화)를 거칠 것. 이 규칙은 rolling-schedule·auto-settlement 전반에 걸쳐 있다.
 - **멱등성**은 모든 쓰기 잡의 핵심 (재시도·중복 실행 대비):
   - 정산: `(studio_id, period_start)` 중복이면 스킵
-  - 결제: 다날은 `order_id = sub_{planId}_{YYYYMM}_{n}` + `CONFIRMING` 선점(주기 락)으로 중복 청구 차단. 레거시 토스 경로는 `order_id = sub_{planId}_{YYYYMM}` + `Idempotency-Key`
+  - 결제: 다날은 `order_id = sub_{planId}_{YYYYMM}_{n}` + `CONFIRMING` 선점(주기 락)으로 중복 청구 차단.
   - 공휴일: `(locdate, seq)` 키로 insert/update/skip 분기
   - 롤링: 이미 존재하는 `scheduled_date`는 재생성 안 함(삭제분 포함 → 되살리지 않음)
 - **롤링 요일 코드**: `ClassRepeatDay.day_of_week` 값이 `dowCode()`의 `SUN`..`SAT` 포맷과 다르면 매칭이 안 돼 조용히 0건 생성된다. rolling-schedule은 이 포맷 불일치를 감지해 `log.warn`으로 노출한다(`DOW_CODES` 검증).
@@ -107,8 +108,8 @@ billing 2종은 `scheduler/index.ts`에서 주석 처리되어 있으나 CLI(`np
 - `src/utils/run-job.ts`: 모든 잡의 실행 진입점 (Advisory Lock + 재시도 + 로깅)
 - `src/utils/holiday-api.client.ts`: 공공데이터포털 `getHoliDeInfo` 호출. 결과 없는 달은 빈 배열로 정규화, `resultCode !== '00'`이면 throw
 - `src/utils/danal-billing.client.ts`: 다날 빌링 승인(`POST /billing/confirm`)·취소(`POST /payments/cancel`). 3분류 에러(`DanalApiError`=확실한 실패 / `DanalResultUnknownError`=결과 불명 / 설정 누락=일반 Error)
-- `src/utils/subscription-cycle.util.ts`: 주기 키·시도 번호·`classifyCycle` (백엔드 복제)
-- `src/utils/toss-billing.client.ts`: 토스 빌링키 자동결제(`POST /v1/billing/{billingKey}`). 실패 시 `TossBillingError(code, message)` throw
+- `src/utils/subscription-cycle.util.ts`: 주기 키·시도 번호·`classifyCycle`·밀린 결제일 규칙(`isCyclePeriodEnded`, `nextChargeDateAfter`) (백엔드 복제)
+- `src/utils/toss-billing.client.ts`: 토스 빌링키 자동결제 클라이언트. **구독 청구 잡은 더 이상 호출하지 않는다**(PG 전환 원칙) — 사용처가 없다
 - `src/logger/index.ts`: `logger` + `createJobLogger(job, runId)` (job/runId 태그 자동 부착)
 
 ### 환경변수 주요 항목
@@ -119,7 +120,7 @@ billing 2종은 `scheduler/index.ts`에서 주석 처리되어 있으나 CLI(`np
 |---|---|---|
 | `NODE_ENV` | `local` | 실행 환경 |
 | `DB_HOST/PORT/NAME/USERNAME/PASSWORD` | 127.0.0.1 / 5432 / ullo / ullo / '' | PostgreSQL 접속 정보 |
-| `TOSS_SECRET_KEY` | '' | 토스페이먼츠 시크릿 키 (레거시 토스 결제 경로) |
+| `TOSS_SECRET_KEY` | '' | (미사용) 구독 청구 잡이 토스를 호출하지 않는다 |
 | `DANAL_BILLING_BATCH_ENABLED` | 꺼짐 | 구독 청구 게이트 (정확히 `true` 일 때만 청구) |
 | `DANAL_SECRET_KEY` / `DANAL_MERCHANT_ID` | '' | 다날 서버 호출 (백엔드와 같은 이름. 배치는 `DANAL_CLIENT_KEY` 불필요) |
 | `DANAL_API_BASE_URL` | https://one-api.danalpay.com | 다날 API 주소 |
