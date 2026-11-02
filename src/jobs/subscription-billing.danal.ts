@@ -47,6 +47,13 @@ class PaymentStateError extends Error {
   }
 }
 
+/** 지급 트랜잭션에서 구독이 청구 시점과 달라졌다(해지·삭제·카드 교체 등) — 지급하지 않고 보상 취소한다 */
+class SubscriptionStateError extends Error {
+  constructor(readonly reason: string) {
+    super(`승인 후 구독 상태 변경: ${reason}`);
+  }
+}
+
 /** PostgreSQL unique 위반(23505). TypeORM QueryFailedError 는 driverError 에, 드라이버 오류는 자신에게 code 가 있다. */
 function isUniqueViolation(err: unknown): boolean {
   const e = err as { code?: string; driverError?: { code?: string } } | null;
@@ -64,6 +71,29 @@ function isCycleOrderId(orderId: string | null, key: string): boolean {
 /** date 컬럼 값(런타임에는 'YYYY-MM-DD' 문자열, 혹은 Date) → 'YYYY-MM-DD' (UTC 변환 없이) */
 function toYmdString(v: Date | string): string {
   return typeof v === 'string' ? v.slice(0, 10) : ymd(v);
+}
+
+const sameValue = (a: unknown, b: unknown): boolean => (a ?? null) === (b ?? null);
+const sameNumeric = (a: unknown, b: unknown): boolean => String(a ?? '') === String(b ?? '');
+
+/**
+ * 잡이 구독을 조회한 뒤 DB 가 바뀌었는지 본다. 바뀐 이유를 돌려주고, 그대로면 null.
+ * 해지·삭제·비활성·결제일 전진·카드 교체·플랜 예약 변경·가격 고정값 변경 어느 것이든 스냅샷으로 청구하지 않는다.
+ */
+function staleReason(snapshot: MemberPlan, fresh: MemberPlan | null): string | null {
+  if (!fresh) return '구독 행 없음';
+  if (fresh.is_del !== IsYn.N) return '구독 삭제됨';
+  if (fresh.is_active !== ActiveStatus.Y) return '구독 비활성';
+  if (!sameValue(fresh.status, snapshot.status)) return `구독 상태 변경(${fresh.status ?? 'NULL'})`;
+  if (!fresh.next_charge_dt || !snapshot.next_charge_dt) return '결제일 없음';
+  if (toYmdString(fresh.next_charge_dt) !== toYmdString(snapshot.next_charge_dt)) return '결제일 변경';
+  if (!sameValue(fresh.member_billing_id, snapshot.member_billing_id)) return '결제 카드 변경';
+  if (!sameValue(fresh.plan_id, snapshot.plan_id)) return '플랜 변경';
+  if (!sameValue(fresh.pending_plan_id, snapshot.pending_plan_id)) return '플랜 변경 예약 변경';
+  if (!sameNumeric(fresh.locked_amount, snapshot.locked_amount) || !sameNumeric(fresh.locked_credit, snapshot.locked_credit)) {
+    return '고정 가격 변경';
+  }
+  return null;
 }
 
 /** 멱등 케이스(T1): 이미 결제됨 → 결제일만 다음 주기로 갱신. manager 를 주면 그 트랜잭션 안에서 갱신한다. */
@@ -127,6 +157,8 @@ type Claim =
   | { kind: 'already' }
   | { kind: 'confirming' }
   | { kind: 'exhausted' }
+  | { kind: 'stale'; reason: string }
+  | { kind: 'withdrawn' }
   | { kind: 'blocked'; failCode: string }
   | { kind: 'claimed'; paymentId: string; orderId: string };
 
@@ -193,6 +225,15 @@ export async function chargeDanalPlan(
     claim = await AppDataSource.transaction(async (m): Promise<Claim> => {
       // 백엔드 chargeRecurring 과 같은 락 문자열 — 백엔드 재청구와 배치가 같은 주기에서 직렬화된다 [T12]
       await m.query(`SELECT pg_advisory_xact_lock(hashtext('subcycle:' || $1))`, [key]);
+
+      // [H-1] 잡 시작 때 읽은 스냅샷을 믿지 않는다 — 구독 행을 잠그고 지금 상태를 다시 확인한다(해지·카드 교체·결제일 전진 등)
+      const fresh = await m.findOne(MemberPlan, { where: { member_plan_id: planId }, lock: { mode: 'pessimistic_write' } });
+      const stale = staleReason(plan, fresh);
+      if (stale) return { kind: 'stale', reason: stale };
+      // [H-3] 탈퇴한 회원의 카드는 청구하지 않는다(회원 행이 없어도 fail-closed)
+      const memberRows: { is_del: string | null }[] = await m.query(`SELECT is_del FROM member WHERE member_id = $1`, [plan.member_id]);
+      if (memberRows[0]?.is_del !== IsYn.N) return { kind: 'withdrawn' };
+
       const rows: { payment_id: string; order_id: string | null; status: string | null; fail_code: string | null }[] =
         await m.query(
           `SELECT payment_id, order_id, status, fail_code FROM payment WHERE order_id = $1 OR order_id LIKE $2 ESCAPE '\\'`,
@@ -252,6 +293,12 @@ export async function chargeDanalPlan(
       return 'skipped';
     case 'confirming':
       log.warn(`이 주기에 결과 확인 중인 결제가 있어 건너뜀 key=${key}`);
+      return 'skipped';
+    case 'stale':
+      log.warn(`구독이 조회 이후 바뀌어 청구하지 않음(${claim.reason}) plan=${planId} key=${key}`);
+      return 'skipped';
+    case 'withdrawn':
+      log.warn(`탈퇴한 회원이라 청구하지 않음 plan=${planId} key=${key}`);
       return 'skipped';
     case 'exhausted':
       log.error(`[CRITICAL] 청구 시도 번호 초과 — 결제 이력 확인 필요 plan=${planId} key=${key}`);
@@ -376,6 +423,13 @@ async function settle(ctx: SettleCtx, log: Log): Promise<ChargeOutcome> {
       if (locked.fail_code && GRANT_BLOCKING_FAIL_CODES.includes(locked.fail_code)) {
         throw new PaymentStateError(`${PaymentStatus.CONFIRMING}:${locked.fail_code}`);
       }
+      // [H-1] 승인 동안 구독이 바뀌었으면(해지·삭제 등) 지급·되살리기 없이 보상 취소로 간다
+      const freshPlan = await m.findOne(MemberPlan, {
+        where: { member_plan_id: ctx.plan.member_plan_id },
+        lock: { mode: 'pessimistic_write' },
+      });
+      const stale = staleReason(ctx.plan, freshPlan);
+      if (stale) throw new SubscriptionStateError(stale);
       await applyGrant(m, locked, tid, ctx);
     });
   } catch (err) {
@@ -400,6 +454,12 @@ async function compensateGrantFailure(
     log.error(
       `[CRITICAL] 보상 취소 전 결제 상태 재확인 실패 — 취소하지 않음 order=${ctx.orderId} tx=${tid} cause=${cause.message} readError=${(err as Error).message}`,
     );
+    // [M-5] 승인된 거래 ID 를 남긴다 — 남기지 않으면 fail_code 없는 CONFIRMING 이라 "진행 중"과 구분되지 않는다
+    await record(
+      ctx.paymentId,
+      { fail_code: 'GRANT_FAILED_UNVERIFIED', fail_reason: `지급 결과 재확인 실패: ${cause.message}`, pg_transaction_id: tid },
+      log,
+    );
     return 'unknown';
   }
   if (current?.status === PaymentStatus.DONE) {
@@ -418,6 +478,14 @@ async function compensateGrantFailure(
   }
   if (cause instanceof PaymentStateError) {
     log.error(`[CRITICAL] 승인 후 결제 상태 변경 감지 — 지급·취소하지 않음 order=${ctx.orderId} tx=${tid} status=${cause.status}`);
+    // 운영자가 건 취소 표식(CONFIRMING:ADMIN_CANCEL_*)은 덮어쓰지 않는다 — 덮으면 지급 차단이 풀린다
+    if (!cause.status?.startsWith(`${PaymentStatus.CONFIRMING}:`)) {
+      await record(
+        ctx.paymentId,
+        { fail_code: 'PAYMENT_STATE_CHANGED', fail_reason: `승인 후 결제 상태 변경: ${cause.status ?? 'NONE'}`, pg_transaction_id: tid },
+        log,
+      );
+    }
     return 'unknown';
   }
 
@@ -496,9 +564,9 @@ async function applyGrant(m: EntityManager, payment: Payment, tid: string, ctx: 
   }
 
   const next = addMonthsClamped(toLocalDate(ctx.cycleYmd), 1);
-  await m.update(
+  const updated = await m.update(
     MemberPlan,
-    { member_plan_id: ctx.plan.member_plan_id },
+    { member_plan_id: ctx.plan.member_plan_id, is_del: IsYn.N },
     {
       plan_id: ctx.chargePlanId,
       pending_plan_id: null,
@@ -512,6 +580,7 @@ async function applyGrant(m: EntityManager, payment: Payment, tid: string, ctx: 
       updated_at: now,
     },
   );
+  if (!updated.affected) throw new SubscriptionStateError('구독 갱신 0행'); // 롤백 후 보상 취소
 }
 
 async function sumValidCredit(m: EntityManager, memberId: string): Promise<number> {

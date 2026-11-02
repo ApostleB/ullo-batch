@@ -29,6 +29,7 @@ class FakeDb {
   credits: Row[] = [];
   creditLogs: Row[] = [];
   masters: Row[] = [];
+  members: Row[] = [];
   queries: { sql: string; params: any[] }[] = [];
   /** 이 엔티티의 save 가 던진다(지급 트랜잭션 실패 주입) */
   failSaveOf: any = null;
@@ -121,6 +122,9 @@ class FakeDb {
           return this.payments
             .filter((p) => p.order_id === key || (p.order_id ?? '').startsWith(prefix))
             .map((p) => ({ payment_id: p.payment_id, order_id: p.order_id, status: p.status, fail_code: p.fail_code ?? null }));
+        }
+        if (sql.includes('FROM member WHERE')) {
+          return this.members.filter((mm) => mm.member_id === params[0]).map((mm) => ({ is_del: mm.is_del }));
         }
         if (sql.includes('FROM member_credit')) {
           const sum = this.credits.filter((c) => c.member_id === params[0] && c.is_del === 'N').reduce((a, c) => a + c.credit, 0);
@@ -245,6 +249,7 @@ beforeEach(() => {
   mockDb.credits = [];
   mockDb.creditLogs = [];
   mockDb.masters = [];
+  mockDb.members = [{ member_id: 'm1', is_del: 'N' }];
   mockDb.queries = [];
   mockDb.failSaveOf = null;
   mockDb.throwAfterCommit = null;
@@ -562,7 +567,12 @@ describe('[T9] 지급 트랜잭션 실패 → 보상', () => {
 
     expect(r).toBe('unknown');
     expect(mockCancel).not.toHaveBeenCalled();
-    expect(mockDb.payments[0].status).toBe('CONFIRMING');
+    // [M-5] 승인된 거래의 ID 와 사유를 남긴다 — 어드민이 "진행 중"과 구분하고 다날에서 거래를 찾을 수 있다
+    expect(mockDb.payments[0]).toMatchObject({
+      status: 'CONFIRMING',
+      fail_code: 'GRANT_FAILED_UNVERIFIED',
+      pg_transaction_id: 'tx-1',
+    });
   });
 
   it('지급 전에 운영자가 취소를 진행 중(ADMIN_CANCEL_PENDING)이면 지급·취소하지 않는다', async () => {
@@ -577,6 +587,8 @@ describe('[T9] 지급 트랜잭션 실패 → 보상', () => {
     expect(mockCancel).not.toHaveBeenCalled();
     expect(mockDb.credits).toHaveLength(0);
     expect(mockDb.payments[0].status).toBe('CONFIRMING');
+    // 운영자가 건 표식을 덮어쓰지 않는다 — 덮으면 이후 지급 차단이 풀린다
+    expect(mockDb.payments[0].fail_code).toBe('ADMIN_CANCEL_PENDING');
   });
 });
 
@@ -720,6 +732,7 @@ describe('금액·크레딧', () => {
 
   it('locked_* 가 null(구 데이터)이면 현재 플랜가로 폴백', async () => {
     okConfirm();
+    Object.assign(dbPlan(), { locked_amount: null, locked_credit: null }); // DB 와 스냅샷이 같아야 청구된다(H-1)
     await run({ plan: { locked_amount: null, locked_credit: null } });
     expect(mockConfirm.mock.calls[0][0].amount).toBe(9900);
     expect(mockDb.credits[0].credit).toBe(10);
@@ -727,6 +740,7 @@ describe('금액·크레딧', () => {
 
   it('크레딧 0 이면 lot·로그를 만들지 않는다', async () => {
     okConfirm();
+    Object.assign(dbPlan(), { locked_credit: 0 });
     await run({ plan: { locked_credit: 0 } });
     expect(mockDb.credits).toHaveLength(0);
     expect(mockDb.creditLogs).toHaveLength(0);
@@ -824,5 +838,159 @@ describe('기록 형식', () => {
     okConfirm();
     await run({ plan: { next_charge_dt: '2026-12-01' } });
     expect(mockConfirm.mock.calls[0][0].orderId).toBe('sub_mp1_202612_1');
+  });
+});
+
+// ====================================================================
+// 07-subscription-review H-1 — 잡 시작 때 읽은 스냅샷을 믿지 않는다: 선점 트랜잭션에서 구독을 잠그고 다시 확인한다
+describe('[H-1] 선점 시점 구독 재검증 — 조회 이후 DB 가 바뀌면 청구하지 않는다', () => {
+  const dbChanged = (over: Row) => Object.assign(mockDb.plans[0], over);
+  const untouched = () => {
+    expect(mockConfirm).not.toHaveBeenCalled();
+    expect(mockDb.payments).toHaveLength(0);
+    expect(mockDb.credits).toHaveLength(0);
+  };
+
+  it('조회 뒤 회원이 해지(CANCELED/is_active=N/next_charge_dt=NULL) → 다날 호출 없음, 해지 상태 유지', async () => {
+    okConfirm();
+    dbChanged({ status: 'CANCELED', is_active: 'N', next_charge_dt: null, canceled_at: new Date() });
+
+    const r = await run(); // 스냅샷(planInDb)은 ACTIVE 그대로
+
+    expect(r).toBe('skipped');
+    untouched();
+    expect(dbPlan()).toMatchObject({ status: 'CANCELED', is_active: 'N', next_charge_dt: null });
+  });
+
+  it('조회 뒤 구독이 삭제(is_del=Y)됨 → 청구하지 않는다', async () => {
+    okConfirm();
+    dbChanged({ is_del: 'Y' });
+    expect(await run()).toBe('skipped');
+    untouched();
+  });
+
+  it('조회 뒤 어드민이 비활성(is_active=N) 처리 → 청구하지 않는다', async () => {
+    okConfirm();
+    dbChanged({ is_active: 'N' });
+    expect(await run()).toBe('skipped');
+    untouched();
+  });
+
+  it('조회 뒤 결제일이 바뀜(다른 경로가 이미 전진) → 청구하지 않는다', async () => {
+    okConfirm();
+    dbChanged({ next_charge_dt: '2026-12-03' });
+    expect(await run()).toBe('skipped');
+    untouched();
+  });
+
+  it('조회 뒤 결제 카드가 교체됨 → 옛 카드로 청구하지 않는다', async () => {
+    okConfirm();
+    dbChanged({ member_billing_id: 'b2' });
+    expect(await run()).toBe('skipped');
+    untouched();
+  });
+
+  it('조회 뒤 플랜 변경이 예약됨 → 이전 플랜으로 청구하고 예약을 지우지 않도록 청구하지 않는다', async () => {
+    okConfirm();
+    dbChanged({ pending_plan_id: 'p2' });
+    expect(await run()).toBe('skipped');
+    untouched();
+    expect(dbPlan().pending_plan_id).toBe('p2');
+  });
+
+  it('조회 뒤 상태가 PAST_DUE 로 바뀜(1차 잡 대상 아님) → 청구하지 않는다', async () => {
+    okConfirm();
+    dbChanged({ status: 'PAST_DUE' });
+    expect(await run()).toBe('skipped');
+    untouched();
+  });
+
+  it('구독 행이 사라졌으면 청구하지 않는다', async () => {
+    okConfirm();
+    mockDb.plans.length = 0;
+    expect(await run()).toBe('skipped');
+    untouched();
+  });
+
+  it('승인 도중 회원이 해지 → 지급하지 않고 보상 취소, 해지가 되살아나지 않는다', async () => {
+    mockConfirm.mockImplementation(async (i: any) => {
+      dbChanged({ status: 'CANCELED', is_active: 'N', next_charge_dt: null });
+      return { transactionId: 'tx-1', orderId: i.orderId, amount: i.amount };
+    });
+    mockCancel.mockResolvedValue({ transactionId: 'cancel-1' });
+
+    const r = await run();
+
+    expect(r).toBe('failed');
+    expect(mockCancel).toHaveBeenCalledTimes(1);
+    expect(mockCancel.mock.calls[0][0]).toMatchObject({ transactionId: 'tx-1', amount: 9900 });
+    expect(mockDb.payments[0]).toMatchObject({ status: 'ABORTED', fail_code: 'GRANT_FAILED_CANCELED' });
+    expect(mockDb.credits).toHaveLength(0);
+    expect(dbPlan()).toMatchObject({ status: 'CANCELED', is_active: 'N', next_charge_dt: null });
+  });
+
+  it('승인 도중 구독이 삭제(is_del=Y)돼도 지급하지 않고 보상 취소', async () => {
+    mockConfirm.mockImplementation(async (i: any) => {
+      dbChanged({ is_del: 'Y' });
+      return { transactionId: 'tx-1', orderId: i.orderId, amount: i.amount };
+    });
+    mockCancel.mockResolvedValue({ transactionId: 'cancel-1' });
+    expect(await run()).toBe('failed');
+    expect(mockCancel).toHaveBeenCalledTimes(1);
+    expect(mockDb.credits).toHaveLength(0);
+  });
+
+  it('보상 취소가 실패하면 결과 불명(CONFIRMING + GRANT_FAILED_CANCEL_FAILED)으로 남긴다', async () => {
+    mockConfirm.mockImplementation(async (i: any) => {
+      dbChanged({ status: 'CANCELED', is_active: 'N', next_charge_dt: null });
+      return { transactionId: 'tx-1', orderId: i.orderId, amount: i.amount };
+    });
+    mockCancel.mockRejectedValue(new DanalApiError('CANCEL_FAIL', '취소 불가'));
+    expect(await run()).toBe('unknown');
+    expect(mockDb.payments[0]).toMatchObject({ status: 'CONFIRMING', fail_code: 'GRANT_FAILED_CANCEL_FAILED', pg_transaction_id: 'tx-1' });
+  });
+
+  it('재시도 잡: PAST_DUE 스냅샷이 DB 에서도 PAST_DUE 면 정상 청구된다 (회귀 방지)', async () => {
+    okConfirm();
+    dbChanged({ status: 'PAST_DUE' });
+    expect(await run({ plan: { status: 'PAST_DUE' }, onFail: 'SUSPENDED' })).toBe('charged');
+  });
+
+  it('status 가 NULL 인 구독도 DB 와 같으면 청구된다 (1차 잡의 NULL 대상)', async () => {
+    okConfirm();
+    dbChanged({ status: null });
+    expect(await run({ plan: { status: null } })).toBe('charged');
+    expect(dbPlan().status).toBe('ACTIVE');
+  });
+});
+
+// 07-subscription-review H-3 — 탈퇴 회원의 카드는 청구하지 않는다
+describe('[H-3] 선점 트랜잭션에서 회원 탈퇴(is_del)를 확인한다', () => {
+  it('회원이 탈퇴(is_del=Y)했으면 다날 호출 없이 건너뛰고 payment 를 만들지 않는다', async () => {
+    okConfirm();
+    mockDb.members = [{ member_id: 'm1', is_del: 'Y' }];
+
+    const r = await run();
+
+    expect(r).toBe('skipped');
+    expect(mockConfirm).not.toHaveBeenCalled();
+    expect(mockDb.payments).toHaveLength(0);
+    expect(dbPlan().status).toBe('ACTIVE'); // 구독 상태는 건드리지 않는다
+  });
+
+  it('회원 행이 없어도 청구하지 않는다 (fail-closed)', async () => {
+    okConfirm();
+    mockDb.members = [];
+    expect(await run()).toBe('skipped');
+    expect(mockConfirm).not.toHaveBeenCalled();
+  });
+
+  it('재시도 잡(PAST_DUE)도 탈퇴 회원이면 청구하지 않는다', async () => {
+    okConfirm();
+    mockDb.members = [{ member_id: 'm1', is_del: 'Y' }];
+    mockDb.plans[0].status = 'PAST_DUE';
+    expect(await run({ plan: { status: 'PAST_DUE' }, onFail: 'SUSPENDED' })).toBe('skipped');
+    expect(mockConfirm).not.toHaveBeenCalled();
+    expect(dbPlan().status).toBe('PAST_DUE');
   });
 });

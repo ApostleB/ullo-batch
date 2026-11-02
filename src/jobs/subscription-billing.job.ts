@@ -34,9 +34,28 @@ interface ChargeResult {
  * (스케줄러 등록도 꺼져 있고, CLI 수동 실행 `npm run job billing` 도 이 게이트를 따른다)
  */
 function batchEnabled(log: Log): boolean {
-  if (config.danal.batchEnabled) return true;
-  log.info('DANAL_BILLING_BATCH_ENABLED 가 켜져 있지 않아 구독 청구를 실행하지 않습니다.');
-  return false;
+  if (!config.danal.batchEnabled) {
+    log.info('DANAL_BILLING_BATCH_ENABLED 가 켜져 있지 않아 구독 청구를 실행하지 않습니다.');
+    return false;
+  }
+  assertNoProdTestKey(log);
+  return true;
+}
+
+/** 다날 테스트 키 접두사 — 백엔드 assertNoDanalTestKeys 와 같다 */
+const DANAL_TEST_SECRET_PREFIX = 'SK_TEST_';
+const PRODUCTION_ENVS: readonly string[] = ['prod', 'production'];
+
+/**
+ * 운영 환경에서 다날 테스트 키로 청구하지 않는다. 테스트 승인이 성공으로 돌아오면 실제 돈 없이 DONE·크레딧 지급·결제일 전진이
+ * 일어나기 때문이다. 키 값은 로그·예외에 남기지 않는다(변수명만).
+ */
+function assertNoProdTestKey(log: Log): void {
+  if (!PRODUCTION_ENVS.includes(String(config.env).toLowerCase())) return;
+  if (!config.danal.secretKey.startsWith(DANAL_TEST_SECRET_PREFIX)) return;
+  const message = '[SECURITY] 운영 환경에 다날 테스트 키가 설정됨: DANAL_SECRET_KEY — 구독 청구를 중단합니다.';
+  log.error(message);
+  throw new Error(message);
 }
 
 /** 매일 21:00 — ACTIVE 구독 중 결제일 도래분 청구 */
@@ -59,7 +78,8 @@ export async function executeRetry(log: Log): Promise<void> {
   const repo = AppDataSource.getRepository(MemberPlan);
   // next_charge_dt가 null이면 결제 주기 계산이 1970년 기준으로 깨지므로 대상에서 제외한다.
   const pastDue = await repo.find({
-    where: { is_del: IsYn.N, status: PlanStatus.PAST_DUE, next_charge_dt: Not(IsNull()) },
+    // is_active=N 은 어드민이 멈춘 구독이다(status 는 그대로 남는다) — 청구하면 is_active 를 Y 로 되살리게 된다.
+    where: { is_del: IsYn.N, is_active: ActiveStatus.Y, status: PlanStatus.PAST_DUE, next_charge_dt: Not(IsNull()) },
   });
   log.info(`재시도 대상(PAST_DUE): ${pastDue.length}건`);
   await processPlans(pastDue, PlanStatus.SUSPENDED, log);

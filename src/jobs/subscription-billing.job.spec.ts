@@ -5,6 +5,7 @@
 import 'reflect-metadata';
 
 const mockConfig = {
+  env: 'local',
   danal: { secretKey: 'fake-secret', merchantId: 'fake-merchant', apiBaseUrl: 'https://danal.test', batchEnabled: true },
   billing: { encKey: '' },
   toss: { secretKey: '', baseUrl: 'https://toss.test' },
@@ -229,5 +230,72 @@ describe('요약 로그', () => {
     expect(summary()).toContain('성공 1');
     expect(summary()).toContain('오류 1');
     expect(log.error).toHaveBeenCalledWith(expect.stringContaining('plan=a'), expect.anything());
+  });
+});
+
+// 07-subscription-review M-9 — 어드민이 비활성화(is_active=N)한 PAST_DUE 구독은 재시도 잡이 청구·복구하지 않는다
+describe('[M-9] 재시도 잡 조회 조건', () => {
+  it('PAST_DUE 중 is_active=Y, is_del=N, next_charge_dt 가 있는 구독만 조회한다', async () => {
+    await executeRetry(log);
+
+    expect(memberPlanRepo.find).toHaveBeenCalledTimes(1);
+    const { where } = memberPlanRepo.find.mock.calls[0][0];
+    expect(where).toMatchObject({ is_del: 'N', is_active: 'Y', status: 'PAST_DUE' });
+    expect(where.next_charge_dt).toBeDefined(); // Not(IsNull())
+  });
+});
+
+// 07-subscription-review M-7 — 운영 배치가 다날 테스트 키(SK_TEST_)로 청구하지 않는다 (백엔드 assertNoDanalTestKeys 와 같은 규칙)
+describe('[M-7] 운영 환경 다날 테스트 키 방어', () => {
+  afterEach(() => {
+    (mockConfig as any).env = 'local';
+    mockConfig.danal.secretKey = 'fake-secret';
+  });
+
+  it.each([
+    ['executePrimary', executePrimary],
+    ['executeRetry', executeRetry],
+  ])('%s: 운영(prod)에서 SK_TEST_ 키면 조회·청구 없이 오류로 중단한다', async (_name, exec) => {
+    (mockConfig as any).env = 'prod';
+    mockConfig.danal.secretKey = 'SK_TEST_abcdef';
+    plans = [planRow('mp1', 'b1')];
+    billings.b1 = billing('b1', 'DANAL');
+
+    await expect(exec(log)).rejects.toThrow(/SECURITY.*DANAL_SECRET_KEY/);
+
+    expect(memberPlanRepo.find).not.toHaveBeenCalled();
+    expect(mockChargeDanalPlan).not.toHaveBeenCalled();
+    expect(JSON.stringify(log.error.mock.calls)).not.toContain('SK_TEST_abcdef'); // 키 값은 로그에 남기지 않는다
+  });
+
+  it('production 표기도 막는다', async () => {
+    (mockConfig as any).env = 'production';
+    mockConfig.danal.secretKey = 'SK_TEST_abcdef';
+    await expect(executePrimary(log)).rejects.toThrow(/SECURITY/);
+  });
+
+  it('운영이라도 라이브 키면 진행한다', async () => {
+    (mockConfig as any).env = 'prod';
+    mockConfig.danal.secretKey = 'SK_LIVE_abcdef';
+    plans = [planRow('mp1', 'b1')];
+    billings.b1 = billing('b1', 'DANAL');
+    await executePrimary(log);
+    expect(mockChargeDanalPlan).toHaveBeenCalledTimes(1);
+  });
+
+  it('로컬 환경의 테스트 키는 허용한다 (테스트 DB 연동용)', async () => {
+    (mockConfig as any).env = 'local';
+    mockConfig.danal.secretKey = 'SK_TEST_abcdef';
+    plans = [planRow('mp1', 'b1')];
+    billings.b1 = billing('b1', 'DANAL');
+    await executePrimary(log);
+    expect(mockChargeDanalPlan).toHaveBeenCalledTimes(1);
+  });
+
+  it('게이트가 꺼져 있으면 키를 검사하지 않고 조용히 종료한다', async () => {
+    (mockConfig as any).env = 'prod';
+    mockConfig.danal.secretKey = 'SK_TEST_abcdef';
+    mockConfig.danal.batchEnabled = false;
+    await expect(executePrimary(log)).resolves.toBeUndefined();
   });
 });
