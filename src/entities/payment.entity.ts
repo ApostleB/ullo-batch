@@ -17,6 +17,9 @@ export class Payment {
   @Column({ type: 'uuid', nullable: true })
   plan_id: string | null;
 
+  @Column({ type: 'uuid', nullable: true })
+  member_plan_id: string | null;
+
   @Column({ type: 'integer', nullable: true })
   grant_credit: number | null;
 

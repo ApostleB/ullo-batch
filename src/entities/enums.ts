@@ -38,6 +38,8 @@ export const PaymentStatus = {
   DONE: 'DONE',
   ABORTED: 'ABORTED',
   CANCELED: 'CANCELED',
+  /** 다날 승인 진행 중 또는 결과 불명 — fail_code 로 구분(null=진행 중). 결과 불명은 어드민이 해소한다 */
+  CONFIRMING: 'CONFIRMING',
 } as const;
 
 /** member_plan.status (구독 상태머신) */

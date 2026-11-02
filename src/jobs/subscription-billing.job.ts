@@ -8,11 +8,10 @@ import { MemberCredit } from '../entities/member-credit.entity';
 import { MemberCreditLog } from '../entities/member-credit-log.entity';
 import { ActiveStatus, IsYn, PaymentStatus, PlanStatus } from '../entities/enums';
 import { chargeBilling } from '../utils/toss-billing.client';
-import { chargeInipayBilling } from '../utils/inipay-billing.client';
-import { decryptBillingKey, isEncryptedBillingKey } from '../utils/billing-crypto.util';
 import { addMonthsClamped, today, ymd } from '../utils/date.util';
 import { config } from '../config';
 import { createJobLogger } from '../logger';
+import { advancePlanOnly, chargeDanalPlan, OnFailStatus } from './subscription-billing.danal';
 
 export const PRIMARY_JOB_NAME = 'subscription-billing';
 export const RETRY_JOB_NAME = 'subscription-billing-retry';
@@ -22,16 +21,27 @@ const CREDIT_VALID_MONTHS = 3;
 
 type Log = ReturnType<typeof createJobLogger>;
 
-/** PG 무관하게 결제 성공 결과를 표준화 — Payment 기록에 그대로 매핑된다. */
+/** PG 무관하게 결제 성공 결과를 표준화 — Payment 기록에 그대로 매핑된다. (이 잡의 토스 레거시 경로 전용) */
 interface ChargeResult {
-  pgProvider: string; // 'toss' | 'inicis'
+  pgProvider: string; // 'toss'
   paymentKey: string | null;
   method: string | null;
   transactionId: string | null;
 }
 
+/**
+ * 운영 게이트 — DANAL_BILLING_BATCH_ENABLED 가 정확히 'true' 가 아니면 DB 조회도 청구도 하지 않는다.
+ * (스케줄러 등록도 꺼져 있고, CLI 수동 실행 `npm run job billing` 도 이 게이트를 따른다)
+ */
+function batchEnabled(log: Log): boolean {
+  if (config.danal.batchEnabled) return true;
+  log.info('DANAL_BILLING_BATCH_ENABLED 가 켜져 있지 않아 구독 청구를 실행하지 않습니다.');
+  return false;
+}
+
 /** 매일 21:00 — ACTIVE 구독 중 결제일 도래분 청구 */
 export async function executePrimary(log: Log): Promise<void> {
+  if (!batchEnabled(log)) return;
   const repo = AppDataSource.getRepository(MemberPlan);
   const due = await repo.find({
     where: [
@@ -45,6 +55,7 @@ export async function executePrimary(log: Log): Promise<void> {
 
 /** 매일 20:00 — 전일 실패(PAST_DUE) 구독 재시도, 실패 시 즉시 정지 */
 export async function executeRetry(log: Log): Promise<void> {
+  if (!batchEnabled(log)) return;
   const repo = AppDataSource.getRepository(MemberPlan);
   // next_charge_dt가 null이면 결제 주기 계산이 1970년 기준으로 깨지므로 대상에서 제외한다.
   const pastDue = await repo.find({
@@ -54,29 +65,36 @@ export async function executeRetry(log: Log): Promise<void> {
   await processPlans(pastDue, PlanStatus.SUSPENDED, log);
 }
 
-async function processPlans(plans: MemberPlan[], onFailStatus: string, log: Log): Promise<void> {
-  let ok = 0;
-  let fail = 0;
+type PlanResult = 'charged' | 'skipped' | 'failed' | 'unknown' | 'reregister';
+
+async function processPlans(plans: MemberPlan[], onFailStatus: OnFailStatus, log: Log): Promise<void> {
+  const count: Record<PlanResult | 'error', number> = {
+    charged: 0,
+    skipped: 0,
+    failed: 0,
+    unknown: 0,
+    reregister: 0,
+    error: 0,
+  };
   for (const plan of plans) {
     try {
-      const result = await processOne(plan, onFailStatus, log);
-      if (result === 'charged' || result === 'skipped') ok += 1;
-      else fail += 1;
+      count[await processOne(plan, onFailStatus, log)] += 1;
     } catch (err) {
-      fail += 1;
+      count.error += 1;
       log.error(`구독 처리 오류 plan=${plan.member_plan_id}`, {
         error: err instanceof Error ? err.message : String(err),
       });
     }
   }
-  log.info(`처리 결과: 성공 ${ok}, 실패 ${fail}`);
+  log.info(
+    `처리 결과: 성공 ${count.charged}, 건너뜀 ${count.skipped}, 실패 ${count.failed}, 결과 불명 ${count.unknown}, 오류 ${count.error}, 재등록 필요 ${count.reregister}건`,
+  );
+  if (count.unknown > 0) {
+    log.error(`[CRITICAL] 결과 불명 ${count.unknown}건 — 다날 관리자 화면 확인 후 어드민에서 해소해야 합니다.`);
+  }
 }
 
-async function processOne(
-  plan: MemberPlan,
-  onFailStatus: string,
-  log: Log,
-): Promise<'charged' | 'skipped' | 'failed'> {
+async function processOne(plan: MemberPlan, onFailStatus: OnFailStatus, log: Log): Promise<PlanResult> {
   // 0) next_charge_dt 없으면 결제 주기 계산 불가 — 안전하게 스킵 (쿼리에서 거르지만 방어적으로 재확인)
   if (!plan.next_charge_dt) {
     log.warn(`next_charge_dt 없음 — 결제 스킵 plan=${plan.member_plan_id}`);
@@ -89,6 +107,17 @@ async function processOne(
         where: { member_billing_id: plan.member_billing_id, is_del: IsYn.N },
       })
     : null;
+
+  // 카드의 PG(provider)로 분기한다. 대소문자는 무시한다.
+  //  - DANAL : 다날 빌링 (subscription-billing.danal.ts)
+  //  - INICIS: 이니시스 시절 카드 — 청구하지 않고 건너뛴다(상태·결제 행 불변). 사용자가 재등록해야 한다.
+  //  - 그 외(NULL, TOSS): 아래 레거시 토스 경로
+  const provider = (billing?.provider ?? '').toUpperCase();
+  if (billing && provider === 'DANAL') return chargeDanalPlan(plan, billing, onFailStatus, log);
+  if (billing && provider === 'INICIS') {
+    log.warn(`이니시스 카드 — 재등록 필요, 청구하지 않음 plan=${plan.member_plan_id}`);
+    return 'reregister';
+  }
 
   // pending_plan_id(플랜 변경 예약)가 있으면 이번 결제부터 신규 플랜 적용
   const effectivePlanId = plan.pending_plan_id ?? plan.plan_id;
@@ -116,55 +145,27 @@ async function processOne(
   const amount = pl.actual_amount!;
   const grant = pl.credit ?? 0;
   const orderName = pl.plan_title ?? '구독 결제';
-  const isInicis = (billing.provider ?? '').toUpperCase() === 'INICIS';
 
-  // 3) 자동결제 (트랜잭션 밖) — 빌링키의 PG(provider)에 따라 토스/이니시스 분기.
-  //    provider NULL 또는 'TOSS' = 레거시 토스 빌링키(이니시스 마이그레이션 이전 발급분).
+  // 3) 자동결제 (트랜잭션 밖) — 여기까지 온 카드는 레거시 토스 빌링키(provider NULL 또는 'TOSS')뿐이다.
   let charge: ChargeResult;
   try {
-    if (isInicis) {
-      // 백엔드가 billing_key 를 AES-256-GCM(enc:v1:) 으로 저장 — 복호화 후 과금
-      if (isEncryptedBillingKey(billing.billing_key) && !config.billing.encKey) {
-        throw Object.assign(new Error('BILLING_KEY_ENC_KEY 가 설정되지 않아 빌링키를 복호화할 수 없습니다.'), {
-          code: 'NO_BILLING_ENC_KEY',
-        });
-      }
-      const billKey = decryptBillingKey(billing.billing_key, config.billing.encKey);
-      // buyer 3종은 INIAPI 필수(빈값 → ER0102) — 회원 정보를 실어 보낸다
-      const [buyer] = (await AppDataSource.query(
-        `SELECT member_nickname, member_name, member_email, member_mobile FROM member WHERE member_id = $1`,
-        [plan.member_id],
-      )) as Array<{ member_nickname: string | null; member_name: string | null; member_email: string | null; member_mobile: string | null }>;
-      const res = await chargeInipayBilling({
-        billKey,
-        orderId,
-        amount,
-        goodName: orderName,
-        buyerName: buyer?.member_nickname ?? buyer?.member_name ?? undefined,
-        buyerEmail: buyer?.member_email ?? undefined,
-        buyerTel: buyer?.member_mobile?.replace(/-/g, '') ?? undefined,
-      });
-      charge = { pgProvider: 'inicis', paymentKey: res.tid, method: 'card', transactionId: res.tid };
-    } else {
-      const r = await chargeBilling({
-        billingKey: billing.billing_key,
-        customerKey: billing.customer_key,
-        amount,
-        orderId,
-        orderName,
-      });
-      charge = {
-        pgProvider: 'toss',
-        paymentKey: r?.paymentKey ?? null,
-        method: r?.method ?? null,
-        transactionId: r?.lastTransactionKey ?? null,
-      };
-    }
+    const r = await chargeBilling({
+      billingKey: billing.billing_key,
+      customerKey: billing.customer_key,
+      amount,
+      orderId,
+      orderName,
+    });
+    charge = {
+      pgProvider: 'toss',
+      paymentKey: r?.paymentKey ?? null,
+      method: r?.method ?? null,
+      transactionId: r?.lastTransactionKey ?? null,
+    };
   } catch (err) {
     const e = err as { code?: string; message?: string };
-    const provider = isInicis ? 'inicis' : 'toss';
-    log.warn(`결제 실패 plan=${plan.member_plan_id} provider=${provider} [${e.code}] ${e.message} → ${onFailStatus}`);
-    await markFailed(plan, onFailStatus, orderId, amount, e.code ?? null, e.message ?? null, provider);
+    log.warn(`결제 실패 plan=${plan.member_plan_id} provider=toss [${e.code}] ${e.message} → ${onFailStatus}`);
+    await markFailed(plan, onFailStatus, orderId, amount, e.code ?? null, e.message ?? null, 'toss');
     return 'failed';
   }
 
@@ -286,20 +287,4 @@ async function markFailed(
     }
     await m.update(MemberPlan, { member_plan_id: plan.member_plan_id }, patch);
   });
-}
-
-/** 멱등 케이스: 이미 결제됨 → 결제일만 다음 주기로 갱신 */
-async function advancePlanOnly(plan: MemberPlan, effectivePlanId: string): Promise<void> {
-  const newNextCharge = addMonthsClamped(new Date(plan.next_charge_dt!), 1);
-  await AppDataSource.getRepository(MemberPlan).update(
-    { member_plan_id: plan.member_plan_id },
-    {
-      plan_id: effectivePlanId,
-      pending_plan_id: null,
-      status: PlanStatus.ACTIVE,
-      next_charge_dt: newNextCharge,
-      end_dt: newNextCharge,
-      updated_at: new Date(),
-    },
-  );
 }

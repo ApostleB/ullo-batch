@@ -22,6 +22,14 @@ export const config = {
     secretKey: process.env.TOSS_SECRET_KEY ?? '',
     baseUrl: 'https://api.tosspayments.com',
   },
+  danal: {
+    // 다날 ONE API 서버 호출 — 백엔드와 같은 환경변수 이름. 값은 .env 로만 주입한다.
+    secretKey: process.env.DANAL_SECRET_KEY ?? '',
+    merchantId: process.env.DANAL_MERCHANT_ID ?? '',
+    apiBaseUrl: process.env.DANAL_API_BASE_URL || 'https://one-api.danalpay.com',
+    // 월 자동결제 배치 게이트 — 정확히 'true' 일 때만 청구한다(기본 꺼짐)
+    batchEnabled: process.env.DANAL_BILLING_BATCH_ENABLED === 'true',
+  },
   inicis: {
     // 빌링(구독) MID 의 자격 — 일반결제(INICIS_MID/INIAPI_KEY)와 다르다 (테스트: INIBillTst)
     billMid: process.env.INICIS_BILL_MID ?? '',

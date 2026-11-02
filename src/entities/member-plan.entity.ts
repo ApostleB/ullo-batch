@@ -48,4 +48,11 @@ export class MemberPlan {
 
   @Column({ type: 'timestamp', nullable: true })
   canceled_at: Date | null;
+
+  // 가입 시점에 고정한 청구 금액/크레딧 (백엔드 엔티티와 동일). null 이면(구 데이터) 현재 플랜가로 폴백.
+  @Column({ type: 'integer', nullable: true })
+  locked_amount: number | null;
+
+  @Column({ type: 'integer', nullable: true })
+  locked_credit: number | null;
 }
