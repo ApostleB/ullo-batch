@@ -3,6 +3,7 @@ import { AppDataSource } from './db/data-source';
 import { logger } from './logger';
 import { runJob } from './utils/run-job';
 import { createJobLogger } from './logger';
+import { parseTestOptions, setTestOptions } from './utils/test-options';
 import * as billing from './jobs/subscription-billing.job';
 import * as rolling from './jobs/rolling-schedule.job';
 import * as settlement from './jobs/auto-settlement.job';
@@ -27,6 +28,14 @@ async function main(): Promise<void> {
   const job = registry[key];
   if (!job) {
     logger.error(`사용법: npm run job <${Object.keys(registry).join(' | ')}>`);
+    process.exit(1);
+  }
+
+  // 재현 테스트 옵션(--as-of/--member) — 운영·비로컬 다날 URL 이면 DB 연결 전에 거부한다. 스케줄러(index.ts)는 쓰지 않는다.
+  try {
+    setTestOptions(parseTestOptions(process.argv.slice(3), process.env));
+  } catch (err) {
+    logger.error(`테스트 옵션 거부: ${err instanceof Error ? err.message : String(err)}`);
     process.exit(1);
   }
 

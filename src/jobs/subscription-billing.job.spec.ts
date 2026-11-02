@@ -316,3 +316,21 @@ describe('[M-7] 운영 환경 다날 테스트 키 방어', () => {
     await expect(executePrimary(log)).resolves.toBeUndefined();
   });
 });
+
+describe('테스트 옵션 --member (재현 전용)', () => {
+  const { setTestOptions, resetTestOptions } = require('../utils/test-options');
+  afterEach(() => resetTestOptions());
+
+  it('옵션이 없으면 조회 조건에 member_id 가 없다', async () => {
+    await executePrimary(log);
+    for (const w of memberPlanRepo.find.mock.calls[0][0].where) expect(w).not.toHaveProperty('member_id');
+  });
+
+  it('--member 가 있으면 primary·retry 조회 모두 그 회원으로 고정한다', async () => {
+    setTestOptions({ memberId: 'm-only' });
+    await executePrimary(log);
+    await executeRetry(log);
+    for (const w of memberPlanRepo.find.mock.calls[0][0].where) expect(w.member_id).toBe('m-only');
+    expect(memberPlanRepo.find.mock.calls[1][0].where.member_id).toBe('m-only');
+  });
+});

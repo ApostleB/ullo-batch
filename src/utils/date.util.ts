@@ -22,9 +22,16 @@ export function toLocalDate(v: Date | string): Date {
   return r;
 }
 
-/** 오늘 로컬 자정 */
+let asOfDate: Date | null = null;
+
+/** 재현 테스트 전용 — 오늘 대신 쓸 날짜. test-options 만 호출한다. null 이면 원복. */
+export function setAsOfDate(d: Date | null): void {
+  asOfDate = d ? new Date(d) : null;
+}
+
+/** 오늘 로컬 자정 (재현 테스트 옵션이 켜져 있으면 그 날짜) */
 export function today(): Date {
-  const d = new Date();
+  const d = asOfDate ? new Date(asOfDate) : new Date();
   d.setHours(0, 0, 0, 0);
   return d;
 }

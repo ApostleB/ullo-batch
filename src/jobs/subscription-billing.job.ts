@@ -5,6 +5,7 @@ import { MemberBilling } from '../entities/member-billing.entity';
 import { ActiveStatus, IsYn, PlanStatus } from '../entities/enums';
 import { today } from '../utils/date.util';
 import { config } from '../config';
+import { getTestMemberId } from '../utils/test-options';
 import { createJobLogger } from '../logger';
 import { chargeDanalPlan, OnFailStatus } from './subscription-billing.danal';
 
@@ -42,14 +43,21 @@ function assertNoProdTestKey(log: Log): void {
   throw new Error(message);
 }
 
+/** 재현 테스트 전용 --member 고정. 옵션이 없으면 빈 객체라 기존 조회와 같다. */
+function memberScope(): { member_id?: string } {
+  const id = getTestMemberId();
+  return id ? { member_id: id } : {};
+}
+
 /** 매일 21:00 — ACTIVE 구독 중 결제일 도래분 청구 */
 export async function executePrimary(log: Log): Promise<void> {
   if (!batchEnabled(log)) return;
   const repo = AppDataSource.getRepository(MemberPlan);
+  const only = memberScope();
   const due = await repo.find({
     where: [
-      { is_del: IsYn.N, is_active: ActiveStatus.Y, status: PlanStatus.ACTIVE, next_charge_dt: LessThanOrEqual(today()) },
-      { is_del: IsYn.N, is_active: ActiveStatus.Y, status: IsNull(), next_charge_dt: LessThanOrEqual(today()) },
+      { is_del: IsYn.N, is_active: ActiveStatus.Y, status: PlanStatus.ACTIVE, next_charge_dt: LessThanOrEqual(today()), ...only },
+      { is_del: IsYn.N, is_active: ActiveStatus.Y, status: IsNull(), next_charge_dt: LessThanOrEqual(today()), ...only },
     ],
   });
   log.info(`결제 대상 구독: ${due.length}건`);
@@ -64,7 +72,7 @@ export async function executeRetry(log: Log): Promise<void> {
     // is_active=N 은 어드민이 멈춘 구독이다(status 는 그대로 남는다) — 청구하면 is_active 를 Y 로 되살리게 된다.
     // 결제일이 도래한(<= 오늘) 구독만 본다: 결제일이 아직 오지 않은 PAST_DUE 를 미리 청구하지 않고 [M-2],
     // next_charge_dt 가 NULL 인 행은 비교에서 자동으로 빠진다(주기 계산이 1970년 기준으로 깨지는 것 방지).
-    where: { is_del: IsYn.N, is_active: ActiveStatus.Y, status: PlanStatus.PAST_DUE, next_charge_dt: LessThanOrEqual(today()) },
+    where: { is_del: IsYn.N, is_active: ActiveStatus.Y, status: PlanStatus.PAST_DUE, next_charge_dt: LessThanOrEqual(today()), ...memberScope() },
   });
   log.info(`재시도 대상(PAST_DUE): ${pastDue.length}건`);
   await processPlans(pastDue, PlanStatus.SUSPENDED, log);
