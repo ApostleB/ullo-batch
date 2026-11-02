@@ -15,10 +15,9 @@ import {
   classifyCycle,
   cycleKey,
   cycleLikePattern,
-  isCyclePeriodEnded,
-  nextChargeDateAfter,
+  nextChargeDateFrom,
 } from '../utils/subscription-cycle.util';
-import { addMonthsClamped, toLocalDate, today, ymd } from '../utils/date.util';
+import { addMonthsClamped, formatLocalDateTime, toLocalDate, today, ymd } from '../utils/date.util';
 import { createJobLogger } from '../logger';
 
 /**
@@ -33,8 +32,12 @@ import { createJobLogger } from '../logger';
 
 type Log = ReturnType<typeof createJobLogger>;
 
-export type ChargeOutcome = 'charged' | 'skipped' | 'failed' | 'unknown';
-export type OnFailStatus = typeof PlanStatus.PAST_DUE | typeof PlanStatus.SUSPENDED;
+export type ChargeOutcome = 'charged' | 'skipped' | 'failed' | 'unknown' | 'canceled';
+/**
+ * 카드 거절 시 구독 상태 전이 — 1차 잡은 PAST_DUE(다음 날 1회 재시도), 재시도 잡은 CANCELED(해지, 다음 결제 없음).
+ * SUSPENDED 는 더 이상 만들지 않는다(기존 DB 행은 어떤 잡도 조회하지 않는다).
+ */
+export type OnFailStatus = typeof PlanStatus.PAST_DUE | typeof PlanStatus.CANCELED;
 
 const BILLING_PROVIDER_DANAL = 'DANAL';
 /** 예약(pending_plan_id) 플랜으로 청구할 수 있는 플랜 종류 — 백엔드 loadSubscribablePlan 과 같다 */
@@ -89,7 +92,7 @@ const sameNumeric = (a: unknown, b: unknown): boolean => String(a ?? '') === Str
  * 잡이 구독을 조회한 뒤 DB 가 바뀌었는지 본다. 바뀐 이유를 돌려주고, 그대로면 null.
  * 해지·삭제·비활성·결제일 전진·카드 교체·플랜 예약 변경·가격 고정값 변경 어느 것이든 스냅샷으로 청구하지 않는다.
  */
-function staleReason(snapshot: MemberPlan, fresh: MemberPlan | null): string | null {
+function staleReason(snapshot: MemberPlan, fresh: MemberPlan | null, opts: { ignorePendingChange?: boolean } = {}): string | null {
   if (!fresh) return '구독 행 없음';
   if (fresh.is_del !== IsYn.N) return '구독 삭제됨';
   if (fresh.is_active !== ActiveStatus.Y) return '구독 비활성';
@@ -98,7 +101,8 @@ function staleReason(snapshot: MemberPlan, fresh: MemberPlan | null): string | n
   if (toYmdString(fresh.next_charge_dt) !== toYmdString(snapshot.next_charge_dt)) return '결제일 변경';
   if (!sameValue(fresh.member_billing_id, snapshot.member_billing_id)) return '결제 카드 변경';
   if (!sameValue(fresh.plan_id, snapshot.plan_id)) return '플랜 변경';
-  if (!sameValue(fresh.pending_plan_id, snapshot.pending_plan_id)) return '플랜 변경 예약 변경';
+  // 승인 이후(지급 직전) 재확인에서는 예약 변경을 허용한다 — 이미 승인된 결제를 취소하지 않고 새 예약은 보존한다 [N-6/N-10]
+  if (!opts.ignorePendingChange && !sameValue(fresh.pending_plan_id, snapshot.pending_plan_id)) return '플랜 변경 예약 변경';
   if (!sameNumeric(fresh.locked_amount, snapshot.locked_amount) || !sameNumeric(fresh.locked_credit, snapshot.locked_credit)) {
     return '고정 가격 변경';
   }
@@ -109,10 +113,11 @@ function staleReason(snapshot: MemberPlan, fresh: MemberPlan | null): string | n
  * 멱등 케이스(T1): 이미 결제된 주기 → 청구 없이 결제일만 다음 주기로 갱신한다(백엔드 재청구 T1 과 같은 동작).
  * - 결제된 회원이므로 ACTIVE 로 둔다(PAST_DUE 에 남기면 다음 재시도 잡이 결제일 전에 청구하려 든다).
  * - 어느 플랜으로 결제됐는지 알 수 없으므로 plan_id·pending_plan_id·고정가는 건드리지 않는다.
- * - 다음 결제일은 오늘 이후로 맞춘다(밀린 결제일이 과거에 남아 연속 청구되지 않게) [C-1].
+ * - 다음 결제일은 그 결제의 실제 청구일(paid_at) + 1개월, 오늘 이후가 아니면 오늘 + 1개월 [정책4].
  */
-async function advancePlanOnly(plan: MemberPlan, cycleYmd: string, manager: EntityManager): Promise<void> {
-  const next = nextChargeDateAfter(cycleYmd, today());
+async function advancePlanOnly(plan: MemberPlan, paidAt: Date | string | null, manager: EntityManager): Promise<void> {
+  const charged = paidAt ? toLocalDate(paidAt) : today();
+  const next = nextChargeDateFrom(charged, today());
   await manager.update(
     MemberPlan,
     { member_plan_id: plan.member_plan_id },
@@ -120,28 +125,97 @@ async function advancePlanOnly(plan: MemberPlan, cycleYmd: string, manager: Enti
   );
 }
 
-/**
- * 밀린 주기(이용기간이 이미 끝난 주기) 처리 [C-1] — 청구하지 않고 다음 결제일만 오늘 이후로 옮긴다.
- * 이용기간(end_dt)은 연장하지 않는다. PAST_DUE 였다면 ACTIVE 로 돌려 새 결제일부터 정상 청구한다(실패 행·SUSPENDED 없음).
- */
-async function reanchorPlan(plan: MemberPlan, cycleYmd: string, manager: EntityManager): Promise<Date> {
-  const next = nextChargeDateAfter(cycleYmd, today());
-  await manager.update(
-    MemberPlan,
-    { member_plan_id: plan.member_plan_id },
-    { status: PlanStatus.ACTIVE, next_charge_dt: next, updated_at: new Date() },
-  );
-  return next;
+/** 구독 해지 패치 — 회원·어드민 해지와 같은 필드(다음 결제 없음). 이미 지급된 크레딧은 건드리지 않는다. */
+function cancelPatch(now: Date): Partial<MemberPlan> {
+  return { status: PlanStatus.CANCELED, is_active: ActiveStatus.N, canceled_at: now, next_charge_dt: null, updated_at: now };
 }
 
-/** 카드가 거절된 실패(T5)의 구독 상태 전이: PAST_DUE(1차) / SUSPENDED(재시도 — 비활성·해지 시각 기록) */
+/** 카드가 거절된 실패(T5)의 구독 상태 전이: PAST_DUE(1차, 다음 날 재시도) / CANCELED(재시도 — 해지) */
 function failPatch(onFailStatus: OnFailStatus, now: Date): Partial<MemberPlan> {
-  const patch: Partial<MemberPlan> = { status: onFailStatus, updated_at: now };
-  if (onFailStatus === PlanStatus.SUSPENDED) {
-    patch.is_active = ActiveStatus.N;
-    patch.canceled_at = now;
+  return onFailStatus === PlanStatus.CANCELED ? cancelPatch(now) : { status: PlanStatus.PAST_DUE, updated_at: now };
+}
+
+/**
+ * 실패 전이는 조건부 UPDATE 로 한다 [N-2] — 청구 도중 회원·어드민이 해지·정지·비활성한 구독을 PAST_DUE/CANCELED 로 덮어쓰지 않는다.
+ * (status 가 NULL 인 구 데이터는 status 조건을 생략하고 is_active=Y·is_del=N 으로만 막는다)
+ * @returns 실제로 전이했는지
+ */
+async function applyFailTransition(m: EntityManager, snapshot: MemberPlan, onFailStatus: OnFailStatus, now: Date): Promise<boolean> {
+  const res = await m.update(
+    MemberPlan,
+    {
+      member_plan_id: snapshot.member_plan_id,
+      is_del: IsYn.N,
+      is_active: ActiveStatus.Y,
+      ...(snapshot.status ? { status: snapshot.status } : {}),
+    },
+    failPatch(onFailStatus, now),
+  );
+  return !!res.affected;
+}
+
+/** 활성 정지 확인 — 백엔드 MemberSuspensionHelper 와 같은 조건(released_at IS NULL AND (end_at IS NULL OR end_at > 지금)) */
+async function isMemberSuspended(m: EntityManager, memberId: string): Promise<boolean> {
+  const rows: unknown[] = await m.query(
+    `SELECT 1 AS one FROM member_suspension WHERE member_id = $1 AND released_at IS NULL AND (end_at IS NULL OR end_at > $2) LIMIT 1`,
+    [memberId, formatLocalDateTime(new Date())],
+  );
+  return rows.length > 0;
+}
+
+/** 이 구독의 결제에 진행 중(PENDING)이거나 결과 불명(UNKNOWN)인 환불이 있는지 [N-5] */
+async function hasUnsettledRefund(m: EntityManager, memberPlanId: string): Promise<boolean> {
+  const rows: unknown[] = await m.query(
+    `SELECT 1 AS one FROM payment_cancel pc JOIN payment p ON p.payment_id = pc.payment_id
+      WHERE p.member_plan_id = $1 AND pc.status IN ('PENDING', 'UNKNOWN') LIMIT 1`,
+    [memberPlanId],
+  );
+  return rows.length > 0;
+}
+
+type Gate =
+  | { kind: 'stale'; reason: string }
+  | { kind: 'withdrawn' }
+  | { kind: 'suspended' };
+
+/**
+ * 청구·실패 전이 공통 사전 확인 — 구독 행을 잠그고 (1) 조회 뒤 바뀌었는지 [H-1] (2) 탈퇴 [H-3] (3) 활성 정지(정책2)를 본다.
+ * 정지 회원이면 이 트랜잭션에서 구독을 해지한다(청구하지 않는다). 통과하면 null.
+ */
+async function gate(m: EntityManager, plan: MemberPlan): Promise<Gate | null> {
+  const fresh = await m.findOne(MemberPlan, { where: { member_plan_id: plan.member_plan_id }, lock: { mode: 'pessimistic_write' } });
+  const stale = staleReason(plan, fresh);
+  if (stale) return { kind: 'stale', reason: stale };
+  const memberRows: { is_del: string | null }[] = await m.query(`SELECT is_del FROM member WHERE member_id = $1`, [plan.member_id]);
+  if (memberRows[0]?.is_del !== IsYn.N) return { kind: 'withdrawn' };
+  if (await isMemberSuspended(m, plan.member_id)) {
+    await m.update(MemberPlan, { member_plan_id: plan.member_plan_id }, cancelPatch(new Date()));
+    return { kind: 'suspended' };
   }
-  return patch;
+  return null;
+}
+
+/**
+ * 청구할 수 없는 카드(이전 PG 카드·카드 정보 없음)의 결제일 구독은 청구하지 않고 해지한다(정책3).
+ * 결제 행·실패 기록을 만들지 않는다. 구독 행을 잠그고 조회 뒤 바뀌지 않았을 때만 해지한다(그 사이 다날 카드로 교체됐을 수 있다).
+ */
+async function cancelUnchargeablePlan(plan: MemberPlan, reason: string, log: Log): Promise<ChargeOutcome> {
+  const planId = plan.member_plan_id;
+  const key = cycleKey(planId, toYmdString(plan.next_charge_dt!));
+  const stale = await AppDataSource.transaction(async (m): Promise<string | null> => {
+    await m.query(`SELECT pg_advisory_xact_lock(hashtext('subcycle:' || $1))`, [key]);
+    const fresh = await m.findOne(MemberPlan, { where: { member_plan_id: planId }, lock: { mode: 'pessimistic_write' } });
+    const changed = staleReason(plan, fresh);
+    if (changed) return changed;
+    await m.update(MemberPlan, { member_plan_id: planId }, cancelPatch(new Date()));
+    return null;
+  });
+  if (stale) {
+    log.warn(`구독이 조회 이후 바뀌어 해지하지 않음(${stale}) plan=${planId}`);
+    return 'skipped';
+  }
+  log.warn(`${reason} — 청구하지 않고 구독을 해지함(카드 재등록 후 새로 구독 필요) plan=${planId}`);
+  return 'canceled';
 }
 
 /**
@@ -172,12 +246,14 @@ function resolveBillingKey(plan: MemberPlan, billing: MemberBilling, log: Log): 
 
 type Claim =
   | { kind: 'already' }
-  | { kind: 'reanchored'; next: string }
   | { kind: 'confirming' }
   | { kind: 'exhausted' }
   | { kind: 'stale'; reason: string }
   | { kind: 'withdrawn' }
+  | { kind: 'suspended' }
+  | { kind: 'refund_pending' }
   | { kind: 'blocked'; failCode: string }
+  | { kind: 'card_failed'; transitioned: boolean }
   | { kind: 'claimed'; paymentId: string; orderId: string };
 
 /**
@@ -186,10 +262,11 @@ type Claim =
  * - 'skipped'  : 청구하지 않음 (T1 결제일만 전진·T2·T3·T11, 사전 검증 불가, 결정 4)
  * - 'failed'   : 확실한 실패 (T5 카드 거절 → 구독 상태 전이 / T8·T9 취소 성공 → 상태 불변)
  * - 'unknown'  : 결과 불명 (T6·T7·T10, 취소 실패) — CONFIRMING 으로 남겨 어드민이 해소한다
+ * - 'canceled' : 청구 없이 구독을 해지함 (이전 PG 카드·카드 없음[정책3], 활성 정지 회원[정책2])
  */
 export async function chargeDanalPlan(
   plan: MemberPlan,
-  billing: MemberBilling,
+  billing: MemberBilling | null,
   onFailStatus: OnFailStatus,
   log: Log,
 ): Promise<ChargeOutcome> {
@@ -205,17 +282,39 @@ export async function chargeDanalPlan(
     log.warn(`결제일이 아직 오지 않아 청구하지 않음 plan=${planId} next_charge_dt=${toYmdString(plan.next_charge_dt)}`);
     return 'skipped';
   }
-  // [T11] 다날 카드가 아니면 청구하지 않는다 — 재등록 후 카드 교체가 필요하다
-  if ((billing.provider ?? '').toUpperCase() !== BILLING_PROVIDER_DANAL) {
-    log.warn(`다날 카드가 아니라 청구하지 않음(재등록 필요) plan=${planId}`);
+  // 기존 DB 의 SUSPENDED(과거 재시도 실패 정책) 행이 넘어와도 오류 없이 건너뛴다 — 청구도, 상태 변경도 하지 않는다
+  if (plan.status === PlanStatus.SUSPENDED) {
+    log.warn(`SUSPENDED 구독은 청구하지 않음(해지하거나 새로 구독) plan=${planId}`);
     return 'skipped';
   }
-  // 사용할 수 없는 카드 — 청구를 시도한 적이 없으므로 결제 행 없이 구독 상태만 전이한다
-  if (billing.is_active !== ActiveStatus.Y) {
-    log.warn(`결제 카드가 비활성이라 결제 불가 plan=${planId} → ${onFailStatus}`);
-    await AppDataSource.manager.update(MemberPlan, { member_plan_id: planId }, failPatch(onFailStatus, new Date()));
-    return 'failed';
+  // [정책3][T11] 다날 카드가 아니면(이전 PG 카드·카드 정보 없음) 청구하지 않고 구독을 해지한다
+  if (!billing || (billing.provider ?? '').toUpperCase() !== BILLING_PROVIDER_DANAL) {
+    return cancelUnchargeablePlan(plan, billing ? '다날 카드가 아님(이전 PG 카드)' : '결제 카드 정보 없음', log);
   }
+
+  const cycleYmd = toYmdString(plan.next_charge_dt);
+  const key = cycleKey(planId, cycleYmd);
+
+  // 사용할 수 없는 카드 — 청구를 시도한 적이 없으므로 결제 행 없이 구독 상태만 전이한다(카드 거절과 같은 실패 정책).
+  // 구독 행을 잠그고 해지·탈퇴·정지·비활성을 확인한 뒤에만 전이한다 [N-2 R3·R9·R10]
+  if (billing.is_active !== ActiveStatus.Y) {
+    const inactive = await AppDataSource.transaction(async (m): Promise<Exclude<Claim, { kind: 'claimed' }>> => {
+      await m.query(`SELECT pg_advisory_xact_lock(hashtext('subcycle:' || $1))`, [key]);
+      const blocked = await gate(m, plan);
+      if (blocked) return blocked;
+      return { kind: 'card_failed', transitioned: await applyFailTransition(m, plan, onFailStatus, new Date()) };
+    });
+    if (inactive.kind === 'card_failed') {
+      log.warn(
+        inactive.transitioned
+          ? `결제 카드가 비활성이라 결제 불가 plan=${planId} → ${onFailStatus}`
+          : `결제 카드가 비활성이지만 구독 상태가 이미 바뀌어 ${onFailStatus} 로 바꾸지 않음 plan=${planId}`,
+      );
+      return 'failed';
+    }
+    return reportGate(inactive, planId, key, log);
+  }
+
   if (!config.danal.secretKey || !config.danal.merchantId) {
     log.error(`[CRITICAL] DANAL_SECRET_KEY / DANAL_MERCHANT_ID 가 설정되지 않아 청구하지 않음 plan=${planId}`);
     return 'skipped';
@@ -245,9 +344,7 @@ export async function chargeDanalPlan(
     return 'skipped';
   }
   const orderName = master.plan_title ?? '구독 결제';
-
-  const cycleYmd = toYmdString(plan.next_charge_dt);
-  const key = cycleKey(planId, cycleYmd);
+  const chargedAt = today(); // 실제 청구일 — 다음 결제일은 이 날 + 1개월 [정책4]
 
   // ===== 선점 트랜잭션: 같은 주기 판정 + CONFIRMING 삽입 (다날 호출 전) =====
   let claim: Claim;
@@ -256,31 +353,25 @@ export async function chargeDanalPlan(
       // 백엔드 chargeRecurring 과 같은 락 문자열 — 백엔드 재청구와 배치가 같은 주기에서 직렬화된다 [T12]
       await m.query(`SELECT pg_advisory_xact_lock(hashtext('subcycle:' || $1))`, [key]);
 
-      // [H-1] 잡 시작 때 읽은 스냅샷을 믿지 않는다 — 구독 행을 잠그고 지금 상태를 다시 확인한다(해지·카드 교체·결제일 전진 등)
-      const fresh = await m.findOne(MemberPlan, { where: { member_plan_id: planId }, lock: { mode: 'pessimistic_write' } });
-      const stale = staleReason(plan, fresh);
-      if (stale) return { kind: 'stale', reason: stale };
-      // [H-3] 탈퇴한 회원의 카드는 청구하지 않는다(회원 행이 없어도 fail-closed)
-      const memberRows: { is_del: string | null }[] = await m.query(`SELECT is_del FROM member WHERE member_id = $1`, [plan.member_id]);
-      if (memberRows[0]?.is_del !== IsYn.N) return { kind: 'withdrawn' };
+      // [H-1][H-3][정책2] 잡 시작 때 읽은 스냅샷을 믿지 않는다 — 구독 행을 잠그고 해지·탈퇴·정지를 다시 확인한다
+      const blocked = await gate(m, plan);
+      if (blocked) return blocked;
+      // [N-5] 이 구독의 환불이 진행 중이거나 결과 불명이면 청구하지 않는다(환불받은 회원에게 다음 주기를 또 청구하지 않게)
+      if (await hasUnsettledRefund(m, planId)) return { kind: 'refund_pending' };
 
-      const rows: { payment_id: string; order_id: string | null; status: string | null; fail_code: string | null }[] =
+      const rows: { payment_id: string; order_id: string | null; status: string | null; fail_code: string | null; paid_at: Date | string | null }[] =
         await m.query(
-          `SELECT payment_id, order_id, status, fail_code FROM payment WHERE order_id = $1 OR order_id LIKE $2 ESCAPE '\\'`,
+          `SELECT payment_id, order_id, status, fail_code, paid_at FROM payment WHERE order_id = $1 OR order_id LIKE $2 ESCAPE '\\'`,
           [key, cycleLikePattern(key)],
         );
       const cycle = classifyCycle(rows, key);
       if (cycle.done) {
         // [T1] 이미 결제된 주기 — 청구 없이 결제일만 전진
-        await advancePlanOnly(plan, cycleYmd, m);
+        const doneRow = rows.find((r) => r.status === PaymentStatus.DONE && isCycleOrderId(r.order_id, key));
+        await advancePlanOnly(plan, doneRow?.paid_at ?? null, m);
         return { kind: 'already' };
       }
-      if (cycle.confirming) return { kind: 'confirming' }; // [T2] (결과 불명 건은 재설정하지 않는다 — 어드민 GRANT 해소가 주기 키를 맞춘다)
-      // [C-1] 이용기간이 끝난 지난 주기는 청구하지 않는다 — 다음 결제일만 오늘 이후로 옮기고 그 주기부터 청구한다
-      if (isCyclePeriodEnded(cycleYmd, today())) {
-        const next = await reanchorPlan(plan, cycleYmd, m);
-        return { kind: 'reanchored', next: ymd(next) };
-      }
+      if (cycle.confirming) return { kind: 'confirming' }; // [T2] (결과 불명 건은 어드민 GRANT 해소가 주기 키를 맞춘다)
       if (cycle.nextAttempt === null) return { kind: 'exhausted' }; // [T3]
       const blockedRow = rows.find(
         (r) =>
@@ -322,31 +413,7 @@ export async function chargeDanalPlan(
     throw err; // 선점 실패 — 다날을 호출하지 않았다
   }
 
-  switch (claim.kind) {
-    case 'already':
-      log.info(`이미 결제됨(멱등) key=${key} → 결제일만 갱신`);
-      return 'skipped';
-    case 'reanchored':
-      log.warn(`결제일이 밀려 지난 주기는 청구하지 않고 다음 결제일을 ${claim.next} 로 재설정함 plan=${planId} key=${key}`);
-      return 'skipped';
-    case 'confirming':
-      log.warn(`이 주기에 결과 확인 중인 결제가 있어 건너뜀 key=${key}`);
-      return 'skipped';
-    case 'stale':
-      log.warn(`구독이 조회 이후 바뀌어 청구하지 않음(${claim.reason}) plan=${planId} key=${key}`);
-      return 'skipped';
-    case 'withdrawn':
-      log.warn(`탈퇴한 회원이라 청구하지 않음 plan=${planId} key=${key}`);
-      return 'skipped';
-    case 'exhausted':
-      log.error(`[CRITICAL] 청구 시도 번호 초과 — 결제 이력 확인 필요 plan=${planId} key=${key}`);
-      return 'skipped';
-    case 'blocked':
-      log.error(
-        `[CRITICAL] 같은 주기에 시스템 오류로 취소된 시도(${claim.failCode})가 있어 청구하지 않음 — 원인 확인 후 어드민 재청구 plan=${planId} key=${key}`,
-      );
-      return 'skipped';
-  }
+  if (claim.kind !== 'claimed') return reportGate(claim, planId, key, log);
 
   return settle(
     {
@@ -359,10 +426,47 @@ export async function chargeDanalPlan(
       orderName,
       chargePlanId: effectivePlanId,
       cycleYmd,
+      chargedAt,
       onFailStatus,
     },
     log,
   );
+}
+
+/** 선점하지 않고 끝난 경우의 로그·결과 */
+function reportGate(claim: Exclude<Claim, { kind: 'claimed' }>, planId: string, key: string, log: Log): ChargeOutcome {
+  switch (claim.kind) {
+    case 'already':
+      log.info(`이미 결제됨(멱등) key=${key} → 결제일만 갱신`);
+      return 'skipped';
+    case 'confirming':
+      log.warn(`이 주기에 결과 확인 중인 결제가 있어 건너뜀 key=${key}`);
+      return 'skipped';
+    case 'stale':
+      log.warn(`구독이 조회 이후 바뀌어 청구하지 않음(${claim.reason}) plan=${planId} key=${key}`);
+      return 'skipped';
+    case 'withdrawn':
+      log.warn(`탈퇴한 회원이라 청구하지 않음 plan=${planId} key=${key}`);
+      return 'skipped';
+    case 'suspended':
+      log.warn(`정지된 회원이라 청구하지 않고 구독을 해지함 plan=${planId} key=${key}`);
+      return 'canceled';
+    case 'refund_pending':
+      log.error(
+        `[CRITICAL] 환불이 진행 중이거나 결과 불명이라 청구하지 않음 — 어드민에서 환불 건을 해소해야 함 plan=${planId} key=${key}`,
+      );
+      return 'skipped';
+    case 'exhausted':
+      log.error(`[CRITICAL] 청구 시도 번호 초과 — 결제 이력 확인 필요 plan=${planId} key=${key}`);
+      return 'skipped';
+    case 'blocked':
+      log.error(
+        `[CRITICAL] 같은 주기에 시스템 오류로 취소된 시도(${claim.failCode})가 있어 청구하지 않음 — 원인 확인 후 어드민 재청구 plan=${planId} key=${key}`,
+      );
+      return 'skipped';
+    case 'card_failed':
+      return 'failed';
+  }
 }
 
 interface SettleCtx {
@@ -376,6 +480,8 @@ interface SettleCtx {
   orderName: string;
   chargePlanId: string;
   cycleYmd: string;
+  /** 실제 청구일(로컬 자정) — 다음 결제일 = 이 날 + 1개월 */
+  chargedAt: Date;
   onFailStatus: OnFailStatus;
 }
 
@@ -404,7 +510,10 @@ async function settle(ctx: SettleCtx, log: Log): Promise<ChargeOutcome> {
             { payment_id: ctx.paymentId, status: PaymentStatus.CONFIRMING },
             { status: PaymentStatus.ABORTED, fail_code: err.code, fail_reason: err.message.slice(0, FAIL_REASON_MAX_LENGTH), updated_at: now },
           );
-          await m.update(MemberPlan, { member_plan_id: planId }, failPatch(ctx.onFailStatus, now));
+          // 조건부 전이 [N-2] — 승인 도중 해지·비활성된 구독은 덮어쓰지 않는다
+          if (!(await applyFailTransition(m, ctx.plan, ctx.onFailStatus, now))) {
+            log.warn(`카드 거절 후 구독 상태가 이미 바뀌어 ${ctx.onFailStatus} 로 바꾸지 않음 plan=${planId}`);
+          }
         });
       } catch (dbErr) {
         log.error(`[CRITICAL] 거절 결과 기록 실패 — 수동 정합 필요 order=${ctx.orderId}: ${(dbErr as Error).message}`);
@@ -466,9 +575,9 @@ async function settle(ctx: SettleCtx, log: Log): Promise<ChargeOutcome> {
         where: { member_plan_id: ctx.plan.member_plan_id },
         lock: { mode: 'pessimistic_write' },
       });
-      const stale = staleReason(ctx.plan, freshPlan);
+      const stale = staleReason(ctx.plan, freshPlan, { ignorePendingChange: true });
       if (stale) throw new SubscriptionStateError(stale);
-      await applyGrant(m, locked, tid, ctx);
+      await applyGrant(m, locked, tid, ctx, freshPlan!);
     });
   } catch (err) {
     return compensateGrantFailure(ctx, tid, err as Error, log);
@@ -550,7 +659,7 @@ async function compensateGrantFailure(
 }
 
 /** payment → DONE, 크레딧 lot·로그, member_plan 갱신 — 지급 트랜잭션 본문 (백엔드 applyGrant 의 RECURRING 분기와 같다) */
-async function applyGrant(m: EntityManager, payment: Payment, tid: string, ctx: SettleCtx): Promise<void> {
+async function applyGrant(m: EntityManager, payment: Payment, tid: string, ctx: SettleCtx, fresh: MemberPlan): Promise<void> {
   const now = new Date();
   await m.update(
     Payment,
@@ -601,14 +710,16 @@ async function applyGrant(m: EntityManager, payment: Payment, tid: string, ctx: 
     );
   }
 
-  // 오늘 이후로 맞춘다 — 정상 주기는 cycle+1개월 그대로이고, 해소(GRANT) 등으로 밀린 주기를 지급하는 경우에도 과거 결제일이 남지 않는다 [C-1]
-  const next = nextChargeDateAfter(ctx.cycleYmd, today());
+  // 다음 결제일 = 실제 청구일 + 1개월 [정책4] (오늘 이후가 아니면 오늘 + 1개월)
+  const next = nextChargeDateFrom(ctx.chargedAt, today());
+  // 승인 도중 회원이 플랜 변경을 새로 예약했다면(청구한 플랜과 다른 예약) 지우지 않고 보존한다 [N-6]
+  const keepPending = fresh.pending_plan_id && fresh.pending_plan_id !== ctx.chargePlanId ? fresh.pending_plan_id : null;
   const updated = await m.update(
     MemberPlan,
     { member_plan_id: ctx.plan.member_plan_id, is_del: IsYn.N },
     {
       plan_id: ctx.chargePlanId,
-      pending_plan_id: null,
+      pending_plan_id: keepPending,
       status: PlanStatus.ACTIVE,
       is_active: ActiveStatus.Y,
       last_payment_id: payment.payment_id,

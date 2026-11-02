@@ -4,6 +4,12 @@ export function ymd(d: Date): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
+/** Date → 'YYYY-MM-DD HH:mm:ss' (로컬 기준) — timestamp(without tz) 컬럼과 앱 시계로 비교할 때 바인딩 값으로 쓴다. 재현 옵션(--as-of)의 영향을 받지 않는다. */
+export function formatLocalDateTime(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${ymd(d)} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 /** 'YYYY-MM-DD' → 로컬 자정 Date */
 export function parseLocalDate(s: string): Date {
   const [y, m, d] = s.split('-').map(Number);

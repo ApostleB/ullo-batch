@@ -4,6 +4,7 @@ import { MemberPlan } from '../entities/member-plan.entity';
 import { MemberBilling } from '../entities/member-billing.entity';
 import { ActiveStatus, IsYn, PlanStatus } from '../entities/enums';
 import { today } from '../utils/date.util';
+import { isExplicitNonProduction } from '../utils/environment.util';
 import { config } from '../config';
 import { getTestMemberId } from '../utils/test-options';
 import { createJobLogger } from '../logger';
@@ -29,16 +30,17 @@ function batchEnabled(log: Log): boolean {
 
 /** 다날 테스트 키 접두사 — 백엔드 assertNoDanalTestKeys 와 같다 */
 const DANAL_TEST_SECRET_PREFIX = 'SK_TEST_';
-const PRODUCTION_ENVS: readonly string[] = ['prod', 'production'];
 
 /**
  * 운영 환경에서 다날 테스트 키로 청구하지 않는다. 테스트 승인이 성공으로 돌아오면 실제 돈 없이 DONE·크레딧 지급·결제일 전진이
  * 일어나기 때문이다. 키 값은 로그·예외에 남기지 않는다(변수명만).
+ * 운영 판단 기준(N-9): NODE_ENV 가 명시적 비운영 값(local·development·dev·test)이 아니면 운영으로 본다. 미주입·오타도 운영이다.
+ * (config.env 는 미주입일 때 'local' 이 되므로 쓰지 않고 원본 config.nodeEnv 를 본다)
  */
 function assertNoProdTestKey(log: Log): void {
-  if (!PRODUCTION_ENVS.includes(String(config.env).toLowerCase())) return;
+  if (isExplicitNonProduction(config.nodeEnv)) return;
   if (!config.danal.secretKey.startsWith(DANAL_TEST_SECRET_PREFIX)) return;
-  const message = '[SECURITY] 운영 환경에 다날 테스트 키가 설정됨: DANAL_SECRET_KEY — 구독 청구를 중단합니다.';
+  const message = '[SECURITY] 운영 환경(또는 NODE_ENV 미지정)에 다날 테스트 키가 설정됨: DANAL_SECRET_KEY — 구독 청구를 중단합니다.';
   log.error(message);
   throw new Error(message);
 }
@@ -64,7 +66,7 @@ export async function executePrimary(log: Log): Promise<void> {
   await processPlans(due, PlanStatus.PAST_DUE, log);
 }
 
-/** 매일 20:00 — 전일 실패(PAST_DUE) 구독 재시도, 실패 시 즉시 정지 */
+/** 매일 20:00 — 전일 실패(PAST_DUE) 구독을 1회 재시도, 재시도도 실패하면 구독 해지(CANCELED) */
 export async function executeRetry(log: Log): Promise<void> {
   if (!batchEnabled(log)) return;
   const repo = AppDataSource.getRepository(MemberPlan);
@@ -75,10 +77,10 @@ export async function executeRetry(log: Log): Promise<void> {
     where: { is_del: IsYn.N, is_active: ActiveStatus.Y, status: PlanStatus.PAST_DUE, next_charge_dt: LessThanOrEqual(today()), ...memberScope() },
   });
   log.info(`재시도 대상(PAST_DUE): ${pastDue.length}건`);
-  await processPlans(pastDue, PlanStatus.SUSPENDED, log);
+  await processPlans(pastDue, PlanStatus.CANCELED, log);
 }
 
-type PlanResult = 'charged' | 'skipped' | 'failed' | 'unknown' | 'reregister';
+type PlanResult = 'charged' | 'skipped' | 'failed' | 'unknown' | 'canceled';
 
 async function processPlans(plans: MemberPlan[], onFailStatus: OnFailStatus, log: Log): Promise<void> {
   const count: Record<PlanResult | 'error', number> = {
@@ -86,7 +88,7 @@ async function processPlans(plans: MemberPlan[], onFailStatus: OnFailStatus, log
     skipped: 0,
     failed: 0,
     unknown: 0,
-    reregister: 0,
+    canceled: 0,
     error: 0,
   };
   for (const plan of plans) {
@@ -100,7 +102,7 @@ async function processPlans(plans: MemberPlan[], onFailStatus: OnFailStatus, log
     }
   }
   log.info(
-    `처리 결과: 성공 ${count.charged}, 건너뜀 ${count.skipped}, 실패 ${count.failed}, 결과 불명 ${count.unknown}, 오류 ${count.error}, 재등록 필요 ${count.reregister}건`,
+    `처리 결과: 성공 ${count.charged}, 건너뜀 ${count.skipped}, 실패 ${count.failed}, 결과 불명 ${count.unknown}, 해지 ${count.canceled}, 오류 ${count.error}건`,
   );
   if (count.unknown > 0) {
     log.error(`[CRITICAL] 결과 불명 ${count.unknown}건 — 다날 관리자 화면 확인 후 어드민에서 해소해야 합니다.`);
@@ -121,15 +123,8 @@ async function processOne(plan: MemberPlan, onFailStatus: OnFailStatus, log: Log
       })
     : null;
 
-  // PG 전환 원칙 — 다날 카드(provider=DANAL, 대소문자 무시)만 청구한다.
-  // 이전 PG(이니시스·토스·provider NULL·알 수 없는 값)와 카드 정보가 없는 구독은 처리하지 않고 건너뛴다:
-  // 구독 상태(PAST_DUE/SUSPENDED)도, 결제 행도 바꾸지 않는다. 그래야 매 실행마다 실패 행이 쌓이거나 상태가 오염되지 않는다.
-  // 사용자가 다날 카드를 새로 등록해 카드 교체 API 로 바꾸면 그때부터 청구된다.
-  if (billing && (billing.provider ?? '').toUpperCase() === 'DANAL') {
-    return chargeDanalPlan(plan, billing, onFailStatus, log);
-  }
-  log.warn(
-    `다날 카드가 아니거나 카드 정보가 없어 청구하지 않음(재등록 필요, 상태·결제 행 불변) plan=${plan.member_plan_id} provider=${billing?.provider ?? 'NONE'}`,
-  );
-  return 'reregister';
+  // PG 전환 원칙 — 다날 카드(provider=DANAL, 대소문자 무시)만 청구한다. 이전 PG(이니시스·토스·provider NULL·알 수 없는 값)와
+  // 카드 정보가 없는 구독은 결제일에 청구하지 않고 구독을 해지한다(정책 3). 해지는 구독 행을 잠그고 재확인한 뒤에 해야 하므로
+  // 판단은 chargeDanalPlan 이 한다(결제 행은 만들지 않는다). 토스·이니시스 호출 경로는 없다 [H-2].
+  return chargeDanalPlan(plan, billing, onFailStatus, log);
 }

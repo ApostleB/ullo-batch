@@ -7,8 +7,7 @@ import {
   classifyCycle,
   cycleKey,
   cycleLikePattern,
-  isCyclePeriodEnded,
-  nextChargeDateAfter,
+  nextChargeDateFrom,
 } from './subscription-cycle.util';
 import { parseLocalDate, ymd } from './date.util';
 
@@ -63,35 +62,38 @@ describe('subscription-cycle.util', () => {
   });
 });
 
-// 밀린 결제일 정책 — 백엔드 subscription-cycle.util.spec.ts 와 입력·기대값이 같다
-describe('밀린 결제일 정책 (isCyclePeriodEnded / nextChargeDateAfter)', () => {
+// 다음 결제일 정책 — 백엔드 subscription-cycle.util.spec.ts 와 입력·기대값이 같다.
+// 다음 결제일은 "실제 청구일 + 1개월"이고, 그 값이 오늘 이후가 아니면(늦게 해소된 결제 등) 오늘 + 1개월이다.
+describe('다음 결제일 정책 (nextChargeDateFrom)', () => {
   const day = (s: string) => parseLocalDate(s);
 
   it.each([
-    ['주기 시작일 + 1개월이 오늘이면 끝난 주기', '2026-10-03', '2026-11-03', true],
-    ['주기 시작일 + 1개월이 내일이면 아직 진행 중인 주기', '2026-10-04', '2026-11-03', false],
-    ['오늘이 결제일이면 진행 중', '2026-11-03', '2026-11-03', false],
-    ['결제일이 미래여도 끝난 주기가 아니다', '2026-11-20', '2026-11-03', false],
-    ['석 달 밀린 주기', '2026-08-15', '2026-11-03', true],
-    ['월말 앵커 1/31 → 2/28 이 3/1 이전이면 끝남', '2026-01-31', '2026-03-01', true],
-  ])('%s', (_name, cycle, todayYmd, expected) => {
-    expect(isCyclePeriodEnded(cycle, day(todayYmd))).toBe(expected);
-  });
-
-  it.each([
-    ['앵커 일자를 유지하며 오늘 이후로', '2026-08-15', '2026-11-03', '2026-11-15'],
-    ['오늘과 같은 날은 "이후"가 아니다', '2026-08-03', '2026-11-03', '2026-12-03'],
-    ['월말 앵커는 원래 일자 기준으로 계산한다(2/28 로 드리프트하지 않음)', '2026-01-31', '2026-03-01', '2026-03-31'],
-    ['정상 주기는 다음 달 같은 날', '2026-11-03', '2026-11-03', '2026-12-03'],
-    ['과거 주기 직전', '2026-10-04', '2026-11-03', '2026-11-04'],
-  ])('%s', (_name, cycle, todayYmd, expected) => {
-    expect(ymd(nextChargeDateAfter(cycle, day(todayYmd)))).toBe(expected);
+    ['제때 청구: 오늘 + 1개월', '2026-11-03', '2026-11-03', '2026-12-03'],
+    ['늦게 청구(오늘이 실제 청구일): 오늘 + 1개월 — 이틀 연속 청구 없음', '2026-11-14', '2026-11-14', '2026-12-14'],
+    ['월말 클램프: 1/31 → 2/28', '2027-01-31', '2027-01-31', '2027-02-28'],
+    ['윤년 클램프: 1/31 → 2/29', '2028-01-31', '2028-01-31', '2028-02-29'],
+    ['어제 청구된 건을 오늘 반영: 어제 + 1개월(오늘 이후)', '2026-11-02', '2026-11-03', '2026-12-02'],
+    ['오래전 청구된 건을 오늘 반영: 오늘 + 1개월', '2026-08-15', '2026-11-03', '2026-12-03'],
+    ['정확히 한 달 전 청구: 오늘과 같은 날은 "이후"가 아니라 오늘 + 1개월', '2026-10-03', '2026-11-03', '2026-12-03'],
+  ])('%s', (_name, charged, todayYmd, expected) => {
+    expect(ymd(nextChargeDateFrom(day(charged), day(todayYmd)))).toBe(expected);
   });
 
   it('결과는 언제나 오늘보다 뒤다', () => {
-    for (const cycle of ['2020-01-31', '2025-12-31', '2026-02-28', '2026-11-03']) {
-      const t = day('2026-11-03');
-      expect(nextChargeDateAfter(cycle, t).getTime()).toBeGreaterThan(t.getTime());
+    const t = day('2026-11-03');
+    for (const charged of ['2020-01-31', '2025-12-31', '2026-02-28', '2026-11-03', '2026-10-03']) {
+      expect(nextChargeDateFrom(day(charged), t).getTime()).toBeGreaterThan(t.getTime());
     }
+  });
+
+  // R6(09 참고) — 저장된 앵커 컬럼이 없으므로 월말 클램프는 누적된다. 이중 청구는 없고 결제일만 앞당겨지는 알려진 동작이다.
+  it('월말 결제일은 청구 때마다 +1개월이라 1/31 → 2/28 → 3/28 로 표류한다(알려진 동작, 이중 청구 없음)', () => {
+    let d = day('2027-01-31');
+    const seen: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      d = nextChargeDateFrom(d, d);
+      seen.push(ymd(d));
+    }
+    expect(seen).toEqual(['2027-02-28', '2027-03-28', '2027-04-28']);
   });
 });

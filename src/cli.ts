@@ -31,9 +31,9 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // 재현 테스트 옵션(--as-of/--member) — 운영·비로컬 다날 URL 이면 DB 연결 전에 거부한다. 스케줄러(index.ts)는 쓰지 않는다.
+  // 재현 테스트 옵션(--as-of/--member) — billing 잡 한정, 알 수 없는 옵션·운영·비로컬 다날 URL·DB 미확인이면 DB 연결 전에 거부한다. 스케줄러(index.ts)는 쓰지 않는다.
   try {
-    setTestOptions(parseTestOptions(process.argv.slice(3), process.env));
+    setTestOptions(parseTestOptions(key, process.argv.slice(3), process.env));
   } catch (err) {
     logger.error(`테스트 옵션 거부: ${err instanceof Error ? err.message : String(err)}`);
     process.exit(1);

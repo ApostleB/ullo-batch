@@ -6,6 +6,7 @@ import 'reflect-metadata';
 
 const mockConfig = {
   env: 'local',
+  nodeEnv: 'local',
   danal: { secretKey: 'fake-secret', merchantId: 'fake-merchant', apiBaseUrl: 'https://danal.test', batchEnabled: true },
   billing: { encKey: '' },
   toss: { secretKey: 'fake-toss', baseUrl: 'https://toss.test' },
@@ -126,7 +127,7 @@ describe('provider 분기', () => {
     expect(mockTransaction).not.toHaveBeenCalled();
   });
 
-  it('1차 잡은 PAST_DUE, 재시도 잡은 SUSPENDED 를 다날 경로에 넘긴다', async () => {
+  it('1차 잡은 PAST_DUE, 재시도 잡은 CANCELED(재시도 실패 시 해지)를 다날 경로에 넘긴다', async () => {
     plans = [planRow('mp1', 'b1')];
     billings.b1 = billing('b1', 'DANAL');
 
@@ -136,43 +137,29 @@ describe('provider 분기', () => {
     expect(mockChargeDanalPlan.mock.calls[0][0]).toBe(plans[0]);
     expect(mockChargeDanalPlan.mock.calls[0][1]).toBe(billings.b1);
     expect(mockChargeDanalPlan.mock.calls[0][2]).toBe('PAST_DUE');
-    expect(mockChargeDanalPlan.mock.calls[1][2]).toBe('SUSPENDED');
+    expect(mockChargeDanalPlan.mock.calls[1][2]).toBe('CANCELED');
   });
 
-  it.each(['INICIS', 'inicis'])('%s → 건너뜀: 청구·상태·결제 행 변경이 없고 요약에 재등록 필요 N건', async (provider) => {
-    plans = [planRow('mp1', 'b1'), planRow('mp2', 'b2')];
-    billings.b1 = billing('b1', provider);
-    billings.b2 = billing('b2', 'INICIS');
-
-    await executePrimary(log);
-
-    expect(mockChargeDanalPlan).not.toHaveBeenCalled();
-    expect(mockTransaction).not.toHaveBeenCalled(); // payment 삽입·구독 갱신 없음
-    expect(manager.save).not.toHaveBeenCalled();
-    expect(manager.update).not.toHaveBeenCalled();
-    expect(summary()).toContain('재등록 필요 2건');
-  });
-
-  // PG 전환 원칙 — 이전 PG(이니시스·토스·provider NULL) 카드는 처리하지 않고 건너뛴다.
-  // 구독을 PAST_DUE/SUSPENDED 로 바꾸거나 실패 행을 쌓지 않는다. 게이트를 켜도 토스로 새지 않는다 [H-2].
+  // PG 전환 원칙(정책 3) — 이전 PG(이니시스·토스·provider NULL) 카드는 결제일에 청구하지 않고 구독을 해지한다.
+  // 잡은 판단하지 않고 chargeDanalPlan 에 넘긴다(구독 잠금·재확인 뒤에 해지해야 하므로). 토스로 새지 않는다 [H-2].
   it.each([
+    ['INICIS', 'INICIS'],
+    ['inicis(소문자)', 'inicis'],
     ['NULL', null],
     ['TOSS', 'TOSS'],
     ['toss(소문자)', 'toss'],
     ['빈 문자열', ''],
     ['알 수 없는 값', 'KCP'],
-  ])('%s → 건너뜀: 청구·상태·결제 행 변경이 없다 (H-2)', async (_name, provider) => {
+  ])('%s → chargeDanalPlan 에 카드 그대로 넘긴다(해지는 거기서, 잠금 아래에서)', async (_name, provider) => {
     plans = [planRow('mp1', 'b1')];
     billings.b1 = billing('b1', provider);
 
     await executePrimary(log);
-    await executeRetry(log);
 
-    expect(mockChargeDanalPlan).not.toHaveBeenCalled();
-    expect(mockTransaction).not.toHaveBeenCalled(); // payment 삽입·구독 갱신 없음
-    expect(manager.save).not.toHaveBeenCalled();
+    expect(mockChargeDanalPlan).toHaveBeenCalledTimes(1);
+    expect(mockChargeDanalPlan.mock.calls[0][1]).toBe(billings.b1);
+    expect(mockTransaction).not.toHaveBeenCalled(); // 잡 레벨에서는 쓰기 없음
     expect(manager.update).not.toHaveBeenCalled();
-    expect(summary()).toContain('재등록 필요 1건');
   });
 
   it('토스 시크릿 키가 있어도 NULL·TOSS 카드는 토스를 호출하지 않는다(코드 경로 자체가 없다)', () => {
@@ -185,17 +172,14 @@ describe('provider 분기', () => {
   it.each([
     ['member_billing_id 가 없음', null],
     ['카드 행이 삭제됨/없음', 'missing'],
-  ])('카드 정보 없음(%s) → 건너뜀: 실패 행·상태 전이 없이 재등록 필요로 센다', async (_name, billingId) => {
+  ])('카드 정보 없음(%s) → 카드 null 로 chargeDanalPlan 에 넘긴다 (거기서 해지)', async (_name, billingId) => {
     plans = [{ ...planRow('mp1', 'x'), member_billing_id: billingId }];
 
     await executePrimary(log);
-    await executeRetry(log);
 
-    expect(mockChargeDanalPlan).not.toHaveBeenCalled();
+    expect(mockChargeDanalPlan).toHaveBeenCalledTimes(1);
+    expect(mockChargeDanalPlan.mock.calls[0][1]).toBeNull();
     expect(mockTransaction).not.toHaveBeenCalled();
-    expect(manager.save).not.toHaveBeenCalled();
-    expect(manager.update).not.toHaveBeenCalled();
-    expect(summary()).toContain('재등록 필요 1건');
   });
 
   it('이니시스 호출 경로는 더 이상 없다', async () => {
@@ -207,7 +191,7 @@ describe('provider 분기', () => {
 });
 
 describe('요약 로그', () => {
-  it('성공·건너뜀·실패·결과 불명·재등록 필요를 따로 센다. 결과 불명은 [CRITICAL] 로 남긴다', async () => {
+  it('성공·건너뜀·실패·결과 불명·해지를 따로 센다. 결과 불명은 [CRITICAL] 로 남긴다', async () => {
     plans = [planRow('a', 'b1'), planRow('b', 'b1'), planRow('c', 'b1'), planRow('d', 'b1'), planRow('e', 'bi')];
     billings.b1 = billing('b1', 'DANAL');
     billings.bi = billing('bi', 'INICIS');
@@ -215,11 +199,12 @@ describe('요약 로그', () => {
       .mockResolvedValueOnce('charged')
       .mockResolvedValueOnce('skipped')
       .mockResolvedValueOnce('failed')
-      .mockResolvedValueOnce('unknown');
+      .mockResolvedValueOnce('unknown')
+      .mockResolvedValueOnce('canceled');
 
     await executePrimary(log);
 
-    expect(summary()).toBe('처리 결과: 성공 1, 건너뜀 1, 실패 1, 결과 불명 1, 오류 0, 재등록 필요 1건');
+    expect(summary()).toBe('처리 결과: 성공 1, 건너뜀 1, 실패 1, 결과 불명 1, 해지 1, 오류 0건');
     expect(JSON.stringify(log.error.mock.calls)).toContain('[CRITICAL]');
   });
 
@@ -262,10 +247,11 @@ describe('[M-9] 재시도 잡 조회 조건', () => {
   });
 });
 
-// 07-subscription-review M-7 — 운영 배치가 다날 테스트 키(SK_TEST_)로 청구하지 않는다 (백엔드 assertNoDanalTestKeys 와 같은 규칙)
-describe('[M-7] 운영 환경 다날 테스트 키 방어', () => {
+// 07-subscription-review M-7 + 09 N-9 — 운영 배치가 다날 테스트 키(SK_TEST_)로 청구하지 않는다.
+// 운영 판단 기준: NODE_ENV 가 명시적 비운영 값(local·development·dev·test)이 아니면 운영으로 본다 (미주입·빈 값·오타·staging 포함 — fail-closed).
+describe('[M-7/N-9] 운영 환경 다날 테스트 키 방어 — NODE_ENV 미주입에도 동작', () => {
   afterEach(() => {
-    (mockConfig as any).env = 'local';
+    (mockConfig as any).nodeEnv = 'local';
     mockConfig.danal.secretKey = 'fake-secret';
   });
 
@@ -273,7 +259,7 @@ describe('[M-7] 운영 환경 다날 테스트 키 방어', () => {
     ['executePrimary', executePrimary],
     ['executeRetry', executeRetry],
   ])('%s: 운영(prod)에서 SK_TEST_ 키면 조회·청구 없이 오류로 중단한다', async (_name, exec) => {
-    (mockConfig as any).env = 'prod';
+    (mockConfig as any).nodeEnv = 'prod';
     mockConfig.danal.secretKey = 'SK_TEST_abcdef';
     plans = [planRow('mp1', 'b1')];
     billings.b1 = billing('b1', 'DANAL');
@@ -285,14 +271,31 @@ describe('[M-7] 운영 환경 다날 테스트 키 방어', () => {
     expect(JSON.stringify(log.error.mock.calls)).not.toContain('SK_TEST_abcdef'); // 키 값은 로그에 남기지 않는다
   });
 
-  it('production 표기도 막는다', async () => {
-    (mockConfig as any).env = 'production';
+  it.each([
+    ['production', 'production'],
+    ['PRODUCTION(대소문자)', 'PRODUCTION'],
+    ['NODE_ENV 미주입(undefined)', undefined],
+    ['빈 문자열', ''],
+    ['staging(명시적 비운영 목록에 없음)', 'staging'],
+    ['오타(prodd)', 'prodd'],
+  ])('NODE_ENV=%s 이고 SK_TEST_ 키면 중단한다 (fail-closed)', async (_name, nodeEnv) => {
+    (mockConfig as any).nodeEnv = nodeEnv;
     mockConfig.danal.secretKey = 'SK_TEST_abcdef';
     await expect(executePrimary(log)).rejects.toThrow(/SECURITY/);
+    expect(memberPlanRepo.find).not.toHaveBeenCalled();
   });
 
-  it('운영이라도 라이브 키면 진행한다', async () => {
-    (mockConfig as any).env = 'prod';
+  it.each(['local', 'development', 'dev', 'test', 'LOCAL'])('명시적 비운영 NODE_ENV=%s 의 테스트 키는 허용한다 (테스트 DB 연동용)', async (nodeEnv) => {
+    (mockConfig as any).nodeEnv = nodeEnv;
+    mockConfig.danal.secretKey = 'SK_TEST_abcdef';
+    plans = [planRow('mp1', 'b1')];
+    billings.b1 = billing('b1', 'DANAL');
+    await executePrimary(log);
+    expect(mockChargeDanalPlan).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([undefined, 'prod'])('NODE_ENV=%s 라도 라이브 키면 진행한다', async (nodeEnv) => {
+    (mockConfig as any).nodeEnv = nodeEnv;
     mockConfig.danal.secretKey = 'SK_LIVE_abcdef';
     plans = [planRow('mp1', 'b1')];
     billings.b1 = billing('b1', 'DANAL');
@@ -300,17 +303,8 @@ describe('[M-7] 운영 환경 다날 테스트 키 방어', () => {
     expect(mockChargeDanalPlan).toHaveBeenCalledTimes(1);
   });
 
-  it('로컬 환경의 테스트 키는 허용한다 (테스트 DB 연동용)', async () => {
-    (mockConfig as any).env = 'local';
-    mockConfig.danal.secretKey = 'SK_TEST_abcdef';
-    plans = [planRow('mp1', 'b1')];
-    billings.b1 = billing('b1', 'DANAL');
-    await executePrimary(log);
-    expect(mockChargeDanalPlan).toHaveBeenCalledTimes(1);
-  });
-
   it('게이트가 꺼져 있으면 키를 검사하지 않고 조용히 종료한다', async () => {
-    (mockConfig as any).env = 'prod';
+    (mockConfig as any).nodeEnv = undefined;
     mockConfig.danal.secretKey = 'SK_TEST_abcdef';
     mockConfig.danal.batchEnabled = false;
     await expect(executePrimary(log)).resolves.toBeUndefined();

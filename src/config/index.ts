@@ -11,6 +11,8 @@ function num(v: string | undefined, def: number): number {
 
 export const config = {
   env: process.env.NODE_ENV ?? 'local',
+  // 원본 NODE_ENV — 미주입이면 undefined. 운영 판단(isExplicitNonProduction)은 기본값 'local' 에 속지 않도록 이 값을 쓴다.
+  nodeEnv: process.env.NODE_ENV,
   db: {
     host: process.env.DB_HOST ?? '127.0.0.1',
     port: num(process.env.DB_PORT, 5432),
