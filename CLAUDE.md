@@ -8,6 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 npm run dev          # ts-node로 개발 실행 (nodemon: src 변경 시 자동 재시작)
 npm run build        # TypeScript 컴파일 → dist/
 npm test             # jest (TZ=Asia/Seoul 고정)
+                     # 앱 자체도 Asia/Seoul 로 고정된다: src/utils/timezone.ts (index.ts·cli.ts 첫 import) + ecosystem.config.js env.TZ
 npm run start        # 프로덕션 실행 (dist/index.js)
 npm run job <key>    # 잡 수동 단건 실행 (DB 연결 → 1회 실행 → 종료)
 ```
@@ -92,6 +93,7 @@ billing 2종과 `credit-expiry-notice`는 `scheduler/index.ts`에서 주석 처�
 - **실패 사유 코드(백엔드와 일치):** 화면 상태(결제실패/재시도대기)·사유 라벨은 백엔드가 `payment.status/fail_code` 에서 조회 시 계산한다. 배치는 `chargeDanalPlan` 의 `settle` 이 처리하지 못한 예기치 못한 예외가 새면 선점한 `CONFIRMING` 행에 `fail_code=BATCH_FAILED`(`fail_code IS NULL` 일 때만, 상태 `CONFIRMING` 유지, 예외는 그대로 던짐 — 운영자 표식·결과 불명 코드를 덮어쓰지 않는다)를 남긴다. 선점 전에 터진 예외는 결제 행이 없으므로 기록할 곳이 없고, 백엔드가 "결제일 경과 + 이번 주기 시도 없음" 을 `BATCH_NOT_RUN`(배치 미실행)으로 계산한다. 코드값·라벨·분류표는 `utils/subscription-fail-reason.util.ts`(백엔드 `subscription-display.util.ts` 복제, spec 표도 같다) — 한쪽을 바꾸면 함께 바꾼다. 3차 리뷰로 `ADMIN_RESOLVED`(운영자 해소: `ADMIN_` 접두 코드는 카드사 거절이 아님)와 끊긴 `CONFIRMING`(2분 초과 → `PG_NO_RESPONSE`) 분류가 추가됐다.
 - **구독 해지 알림(카카오 스텁):** 배치가 구독을 해지하는 모든 경로 — 재시도 실패(`RETRY_FAILED`, 비활성 카드 포함), 정지 회원(`MEMBER_SUSPENDED`), 이전 PG 카드·카드 없음(`OLD_PG_CARD`) — 에서 해지 UPDATE 와 같은 트랜잭션에서 `member_notification`(category=`KAKAO_STUB`, 앱 목록에 보이지 않음)에 기록한다(`utils/subscription-cancel-notice.util.ts`, 백엔드 `SubscriptionCancelNotifier` 의 사유 코드·문구 복제). 카카오 연동·실제 발송은 없다. 알림 insert 는 `manager.transaction`(SAVEPOINT)으로 감싸 실패해도 해지·결제 트랜잭션을 깨지 않고(`[NOTIFY_FAILED]` 로그만), 해지가 롤백되면 알림도 함께 사라진다. 1차 실패(`PAST_DUE`)·결과 불명·시스템 오류 취소는 해지가 아니라 알림이 없다. 크레딧 소멸 기한 같은 정책 문구는 넣지 않는다.
 - **provider 분기**(`member_billing.provider`, 대소문자 무시): `DANAL` 만 청구한다. 그 외(INICIS·TOSS·NULL·알 수 없는 값)와 카드 정보가 없는 구독은 **결제일에 청구하지 않고 구독을 해지**한다(`cancelUnchargeablePlan` — 구독 행을 잠그고 조회 이후 바뀌지 않았을 때만, 결제 행·실패 기록 없음, 요약 로그 `해지 N건`). 결제일이 아직 오지 않았으면 건드리지 않는다(카드 교체 시간). 토스·이니시스 호출 경로는 없다.
+- **탈퇴 회원 [D-4]:** `member.is_del != 'N'`(또는 회원 행 없음)이면 청구하지 않고 **알림 없이** 구독을 해지한다(`canceled`, `CANCELED`·결제일 NULL, 결제 행·실패 기록·`KAKAO_STUB` 알림 없음). 선점 트랜잭션의 `gate()` 가 정지 확인보다 먼저 판정하고(다날 카드·비활성 카드·재시도 잡 공통), 이전 PG 카드·카드 없음 해지(`cancelUnchargeablePlan`)도 같은 확인 뒤 알림만 생략한다. 이전에는 다날 카드 구독이 `skipped` 로 PAST_DUE 에 영구히 남고, 이전 PG 해지는 탈퇴 회원에게 알림 행을 만들었다. 결제일이 아직 오지 않았거나 조회 뒤 구독이 바뀌었으면 건드리지 않는다. 백엔드 `chargeRecurring` 과 같은 동작표다.
 - **정지 회원(안전장치):** 선점 트랜잭션에서 `member_suspension`(`released_at IS NULL AND (end_at IS NULL OR end_at > 지금)`)을 확인해 청구하지 않고 구독을 해지한다. 정지 서비스가 정지 시점에 구독을 해지하므로 이 경로는 안전장치다.
 - **환불 진행 중:** 이 구독 결제에 `payment_cancel` `PENDING`/`UNKNOWN` 이 있으면 청구하지 않는다(`[CRITICAL]`, 어드민이 환불 건 해소 필요).
 - **밀린 결제일(배치가 못 돈 날):** 다음 실행에서 지난 주기를 **한 번만** 청구하고(청구 없이 재설정하지 않는다 — 이전 `reanchor`/`nextChargeDateAfter` 제거) 다음 결제일은 실제 청구일 + 1개월이라 이틀 연속 청구가 없다. 주기 키는 `next_charge_dt` 의 월이므로 오래 밀린 주기도 그 달 키로 한 번만 청구된다. 이미 DONE 인 주기(T1)는 청구 없이 `paid_at + 1개월`(오늘 이후가 아니면 오늘 + 1개월)로 결제일만 옮긴다. 결제일이 아직 오지 않은 구독은 청구하지 않고, `CONFIRMING` 이 있는 주기는 어드민 해소가 먼저다. 어드민이 못 돈 구독을 수동 청구할 수 있다(백엔드 `retry-charge`, 같은 주기 키·락).
@@ -117,6 +119,7 @@ billing 2종과 `credit-expiry-notice`는 `scheduler/index.ts`에서 주석 처�
 
 ### 반드시 알아야 할 공통 규칙
 
+- **프로세스 시간대 [D-3]:** `today()`·`ymd()`·node-schedule cron(`0 21 * * *` 등)이 모두 프로세스 로컬 시간이라 `src/utils/timezone.ts` 가 `process.env.TZ='Asia/Seoul'` 로 고정한다 — `index.ts`·`cli.ts` 의 **첫 import**(다른 모듈이 Date 를 쓰기 전)여야 하고 `ecosystem.config.js` 의 `env.TZ` 로도 고정한다. 새 진입점은 첫 import 로 넣을 것. `src/utils/timezone.spec.ts` 가 `TZ=UTC` 자식 프로세스로 KST 날짜·cron 시각을 검증한다.
 - **date 컬럼 UTC off-by-one**: TypeORM의 `date` 타입은 런타임에 `'YYYY-MM-DD'` 문자열로 온다. `new Date('YYYY-MM-DD')`는 UTC 자정으로 파싱되어 음수 오프셋(KST)에서 하루가 어긋난다. 날짜 비교/포맷 전에 반드시 `toLocalDate()`(문자열/Date 모두 로컬 자정으로 정규화)를 거칠 것. 이 규칙은 rolling-schedule·auto-settlement 전반에 걸쳐 있다.
 - **멱등성**은 모든 쓰기 잡의 핵심 (재시도·중복 실행 대비):
   - 정산: `(studio_id, period_start)` 중복이면 스킵

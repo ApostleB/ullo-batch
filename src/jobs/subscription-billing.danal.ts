@@ -191,6 +191,12 @@ async function hasUnsettledRefund(m: EntityManager, memberPlanId: string): Promi
   return rows.length > 0;
 }
 
+/** 탈퇴한 회원(member.is_del != 'N') 또는 회원 행이 없는지 [H-3][D-4] — 백엔드 SubscriptionChargeService.isMemberWithdrawn 과 같은 판단 */
+async function isMemberWithdrawn(m: EntityManager, memberId: string): Promise<boolean> {
+  const rows: { is_del: string | null }[] = await m.query(`SELECT is_del FROM member WHERE member_id = $1`, [memberId]);
+  return rows[0]?.is_del !== IsYn.N;
+}
+
 type Gate =
   | { kind: 'stale'; reason: string }
   | { kind: 'withdrawn' }
@@ -198,14 +204,17 @@ type Gate =
 
 /**
  * 청구·실패 전이 공통 사전 확인 — 구독 행을 잠그고 (1) 조회 뒤 바뀌었는지 [H-1] (2) 탈퇴 [H-3] (3) 활성 정지(정책2)를 본다.
- * 정지 회원이면 이 트랜잭션에서 구독을 해지한다(청구하지 않는다). 통과하면 null.
+ * 탈퇴 회원이면 알림 없이, 정지 회원이면 해지 알림과 함께 이 트랜잭션에서 구독을 해지한다(청구하지 않는다). 통과하면 null.
  */
 async function gate(m: EntityManager, plan: MemberPlan, log: Log): Promise<Gate | null> {
   const fresh = await m.findOne(MemberPlan, { where: { member_plan_id: plan.member_plan_id }, lock: { mode: 'pessimistic_write' } });
   const stale = staleReason(plan, fresh);
   if (stale) return { kind: 'stale', reason: stale };
-  const memberRows: { is_del: string | null }[] = await m.query(`SELECT is_del FROM member WHERE member_id = $1`, [plan.member_id]);
-  if (memberRows[0]?.is_del !== IsYn.N) return { kind: 'withdrawn' };
+  // [D-4] 탈퇴 회원의 열린 구독은 청구하지 않고 알림 없이 해지한다(탈퇴 회원에게 KAKAO_STUB 행을 남기지 않는다)
+  if (await isMemberWithdrawn(m, plan.member_id)) {
+    await m.update(MemberPlan, { member_plan_id: plan.member_plan_id }, cancelPatch(new Date()));
+    return { kind: 'withdrawn' };
+  }
   if (await isMemberSuspended(m, plan.member_id)) {
     await m.update(MemberPlan, { member_plan_id: plan.member_plan_id }, cancelPatch(new Date()));
     await recordSubscriptionCancelNotice(
@@ -231,6 +240,8 @@ async function cancelUnchargeablePlan(plan: MemberPlan, reason: string, log: Log
     const changed = staleReason(plan, fresh);
     if (changed) return changed;
     await m.update(MemberPlan, { member_plan_id: planId }, cancelPatch(new Date()));
+    // [D-4] 탈퇴 회원이면 해지만 하고 알림은 남기지 않는다
+    if (await isMemberWithdrawn(m, plan.member_id)) return null;
     await recordSubscriptionCancelNotice(
       m,
       { memberId: plan.member_id, memberPlanId: planId, reason: SubscriptionCancelReason.OLD_PG_CARD },
@@ -294,7 +305,7 @@ type Claim =
  *                같은 주기는 다음 실행에서 다음 시도 번호로 다시 청구한다
  * - 'failed'   : 그 밖의 확실한 실패 (비활성 카드 전이 / T8·T9 취소 성공 → 상태 불변)
  * - 'unknown'  : 결과 불명 (T6·T7·T10, 취소 실패) — CONFIRMING 으로 남겨 어드민이 해소한다
- * - 'canceled' : 청구 없이 구독을 해지함 (이전 PG 카드·카드 없음[정책3], 활성 정지 회원[정책2])
+ * - 'canceled' : 청구 없이 구독을 해지함 (이전 PG 카드·카드 없음[정책3], 활성 정지 회원[정책2], 탈퇴 회원[D-4 — 알림 없음])
  */
 export async function chargeDanalPlan(
   plan: MemberPlan,
@@ -506,8 +517,8 @@ function reportGate(claim: Exclude<Claim, { kind: 'claimed' }>, planId: string, 
       log.warn(`구독이 조회 이후 바뀌어 청구하지 않음(${claim.reason}) plan=${planId} key=${key}`);
       return 'skipped';
     case 'withdrawn':
-      log.warn(`탈퇴한 회원이라 청구하지 않음 plan=${planId} key=${key}`);
-      return 'skipped';
+      log.warn(`탈퇴한 회원이라 청구하지 않고 알림 없이 구독을 해지함 plan=${planId} key=${key}`);
+      return 'canceled';
     case 'suspended':
       log.warn(`정지된 회원이라 청구하지 않고 구독을 해지함 plan=${planId} key=${key}`);
       return 'canceled';

@@ -1291,34 +1291,75 @@ describe('[H-1] 선점 시점 구독 재검증 — 조회 이후 DB 가 바뀌�
   });
 });
 
-// 07-subscription-review H-3 — 탈퇴 회원의 카드는 청구하지 않는다
-describe('[H-3] 선점 트랜잭션에서 회원 탈퇴(is_del)를 확인한다', () => {
-  it('회원이 탈퇴(is_del=Y)했으면 다날 호출 없이 건너뛰고 payment 를 만들지 않는다', async () => {
-    okConfirm();
-    mockDb.members = [{ member_id: 'm1', is_del: 'Y' }];
-
-    const r = await run();
-
-    expect(r).toBe('skipped');
+// 07-subscription-review H-3 / D-4 — 탈퇴 회원의 열린 구독은 청구하지 않고 알림 없이 해지한다
+describe('[H-3][D-4] 탈퇴 회원(member.is_del=Y 또는 회원 행 없음)의 구독은 청구하지 않고 알림 없이 해지한다', () => {
+  const expectCanceledSilently = () => {
     expect(mockConfirm).not.toHaveBeenCalled();
     expect(mockDb.payments).toHaveLength(0);
-    expect(dbPlan().status).toBe('ACTIVE'); // 구독 상태는 건드리지 않는다
+    expect(dbPlan()).toMatchObject({ status: 'CANCELED', is_active: 'N', next_charge_dt: null });
+    expect(dbPlan().canceled_at).toBeInstanceOf(Date);
+    expect(mockDb.notifications).toHaveLength(0); // 탈퇴 회원에게 KAKAO_STUB 알림을 남기지 않는다
+  };
+
+  it('다날 카드 구독: 다날 호출·결제 행 없이 CANCELED 로 해지한다 (이전에는 skipped 로 영구히 남았다)', async () => {
+    okConfirm();
+    mockDb.members = [{ member_id: 'm1', is_del: 'Y' }];
+    expect(await run()).toBe('canceled');
+    expectCanceledSilently();
   });
 
-  it('회원 행이 없어도 청구하지 않는다 (fail-closed)', async () => {
+  it('회원 행이 없어도(fail-closed) 청구하지 않고 해지한다', async () => {
     okConfirm();
     mockDb.members = [];
-    expect(await run()).toBe('skipped');
-    expect(mockConfirm).not.toHaveBeenCalled();
+    expect(await run()).toBe('canceled');
+    expectCanceledSilently();
   });
 
-  it('재시도 잡(PAST_DUE)도 탈퇴 회원이면 청구하지 않는다', async () => {
+  it('재시도 잡(PAST_DUE)도 탈퇴 회원이면 청구하지 않고 해지한다', async () => {
     okConfirm();
     mockDb.members = [{ member_id: 'm1', is_del: 'Y' }];
     mockDb.plans[0].status = 'PAST_DUE';
-    expect(await run({ plan: { status: 'PAST_DUE' }, onFail: 'CANCELED' })).toBe('skipped');
-    expect(mockConfirm).not.toHaveBeenCalled();
-    expect(dbPlan().status).toBe('PAST_DUE');
+    expect(await run({ plan: { status: 'PAST_DUE' }, onFail: 'CANCELED' })).toBe('canceled');
+    expectCanceledSilently();
+  });
+
+  it('이전 PG 카드 구독: 탈퇴 회원이면 OLD_PG_CARD 알림 없이 해지한다 (보고서 D-4 — be111111 재현)', async () => {
+    mockDb.members = [{ member_id: 'm1', is_del: 'Y' }];
+    mockDb.plans[0].status = 'PAST_DUE';
+    expect(await run({ plan: { status: 'PAST_DUE' }, billing: { provider: 'INICIS' }, onFail: 'CANCELED' })).toBe('canceled');
+    expectCanceledSilently();
+  });
+
+  it('카드 정보가 없는 구독도 탈퇴 회원이면 알림 없이 해지한다', async () => {
+    mockDb.members = [{ member_id: 'm1', is_del: 'Y' }];
+    expect(await run({ billing: null })).toBe('canceled');
+    expectCanceledSilently();
+  });
+
+  it('탈퇴하지 않은 회원의 이전 PG 구독은 기존대로 OLD_PG_CARD 알림과 함께 해지한다', async () => {
+    expect(await run({ billing: { provider: 'INICIS' } })).toBe('canceled');
+    expect(mockDb.notifications.map((n) => n.link)).toEqual(['subscription/mp1?reason=OLD_PG_CARD']);
+  });
+
+  it('활성 정지 회원이 탈퇴했으면 탈퇴가 먼저다 — 정지 해지 알림도 남기지 않는다', async () => {
+    mockDb.members = [{ member_id: 'm1', is_del: 'Y' }];
+    mockDb.suspensions.push({ member_id: 'm1', released_at: null, end_at: null });
+    expect(await run()).toBe('canceled');
+    expectCanceledSilently();
+  });
+
+  it('조회 뒤 구독이 바뀌었으면(카드 교체) 탈퇴 회원이어도 해지하지 않는다', async () => {
+    mockDb.members = [{ member_id: 'm1', is_del: 'Y' }];
+    Object.assign(dbPlan(), { member_billing_id: 'b-new' });
+    expect(await run({ billing: { provider: 'INICIS' } })).toBe('skipped');
+    expect(dbPlan()).toMatchObject({ status: 'ACTIVE', is_active: 'Y' });
+  });
+
+  it('결제일이 아직 오지 않았으면 탈퇴 회원이어도 건드리지 않는다', async () => {
+    Object.assign(dbPlan(), { next_charge_dt: '2026-11-20' });
+    mockDb.members = [{ member_id: 'm1', is_del: 'Y' }];
+    expect(await run({ plan: { next_charge_dt: '2026-11-20' } })).toBe('skipped');
+    expect(dbPlan().status).toBe('ACTIVE');
   });
 });
 
@@ -1516,11 +1557,11 @@ describe('[정책1] 결제 실패 → PAST_DUE → 재시도 실패 시 해지',
     expect(dbPlan()).toMatchObject({ status: 'CANCELED', is_active: 'N', next_charge_dt: null });
   });
 
-  it('[N-2 R10] 비활성 카드 + 탈퇴 회원: 구독 상태를 바꾸지 않는다', async () => {
+  it('[N-2 R10][D-4] 비활성 카드 + 탈퇴 회원: PAST_DUE 로 전이하지 않고 알림 없이 해지한다', async () => {
     mockDb.members[0].is_del = 'Y';
-    const before = JSON.stringify(mockDb.plans);
-    expect(await run({ billing: { is_active: 'N' } })).toBe('skipped');
-    expect(JSON.stringify(mockDb.plans)).toBe(before);
+    expect(await run({ billing: { is_active: 'N' } })).toBe('canceled');
+    expect(dbPlan()).toMatchObject({ status: 'CANCELED', is_active: 'N', next_charge_dt: null });
+    expect(mockDb.notifications).toHaveLength(0);
   });
 
   it('[N-2 R3] 비활성 카드 + 조회 뒤 해지된 구독: 해지 상태를 PAST_DUE 로 덮어쓰지 않는다', async () => {

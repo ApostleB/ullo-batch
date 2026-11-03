@@ -1,3 +1,4 @@
+import './utils/timezone'; // 반드시 첫 import — 프로세스 TZ 를 Asia/Seoul 로 고정 [D-3]
 import 'reflect-metadata';
 import { AppDataSource } from './db/data-source';
 import { logger } from './logger';
