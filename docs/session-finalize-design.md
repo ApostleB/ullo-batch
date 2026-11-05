@@ -29,7 +29,7 @@ BOOKED ─┬─ checked_in_at 있음 ──▶ COMPLETED
 
 ## 배치 동작
 
-매 N분 실행. 대상: `status NOT IN ('HOLD', 'COMPLETED')` 스케줄.
+매 N분 실행. 대상: A는 `status='OPEN'`, B는 `status IN ('OPEN', 'STARTED', 'CLOSED')` 스케줄(`HOLD`·`CANCELLED`·`COMPLETED` 제외). `CLOSED`(파트너 마감)는 A를 거치지 않고 B의 컷오프가 지나면 `COMPLETED`가 된다.
 
 | 단계 | 조건 | 동작 |
 |---|---|---|

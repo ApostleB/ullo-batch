@@ -12,10 +12,11 @@ const CLASS_END = `(sch.scheduled_date + COALESCE(sch.end_time, TIME '23:59:59')
 /**
  * 수업 종료 처리 — docs/session-finalize-design.md 의 확정 설계.
  *
- * A. 시작 처리: OPEN & 시작시각 경과 → STARTED
+ * A. 시작 처리: OPEN & 시작시각 경과 → STARTED (CLOSED 는 STARTED 로 바꾸지 않는다)
  * B. 종료 처리 (수업 단위 판정, 트랜잭션):
  *    - 컷오프 = 종료시각 (미체크인 BOOKED 멤버가 있으면 +1시간 유예)
- *    - 컷오프 경과 수업 → status COMPLETED (HOLD는 대상 제외 = PARTNER/ADMIN이 처리 중)
+ *    - 컷오프 경과 OPEN·STARTED·CLOSED 수업 → status COMPLETED
+ *      (HOLD는 대상 제외 = PARTNER/ADMIN이 처리 중, CANCELLED·COMPLETED도 제외)
  *    - 해당 수업의 BOOKED 세션: 체크인 → COMPLETED / 미체크인 → NO_SHOW
  *    - 크레딧은 예약 시 이미 차감되므로 여기서는 건드리지 않는다 (이중 차감 방지)
  *
@@ -47,17 +48,23 @@ export async function execute(log: Log): Promise<void> {
       const claimed = await runner.query(
         `UPDATE studio_class_schedule AS sch
          SET status = $1, updated_at = now()
-         WHERE sch.is_del = 'N' AND sch.status IN ($2, $3)
+         WHERE sch.is_del = 'N' AND sch.status IN ($2, $3, $4)
            AND ${CLASS_END}
                + (CASE WHEN EXISTS (
                     SELECT 1 FROM member_class_session s
                     WHERE s.class_schedule_id = sch.class_schedule_id
-                      AND s.is_del = 'N' AND s.session_status = $4
+                      AND s.is_del = 'N' AND s.session_status = $5
                       AND s.checked_in_at IS NULL)
                   THEN INTERVAL '1 hour' ELSE INTERVAL '0' END)
                < LOCALTIMESTAMP
          RETURNING sch.class_schedule_id`,
-        [ScheduleStatus.COMPLETED, ScheduleStatus.OPEN, ScheduleStatus.STARTED, SessionStatus.BOOKED],
+        [
+          ScheduleStatus.COMPLETED,
+          ScheduleStatus.OPEN,
+          ScheduleStatus.STARTED,
+          ScheduleStatus.CLOSED,
+          SessionStatus.BOOKED,
+        ],
         true,
       );
       const scheduleIds: string[] = (claimed.records ?? []).map(

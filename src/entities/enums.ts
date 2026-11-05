@@ -16,11 +16,17 @@ export const SessionStatus = {
   NO_SHOW: 'NO_SHOW',
 } as const;
 
-/** studio_class_schedule.status (수업 상태머신: OPEN → STARTED → COMPLETED, HOLD는 PARTNER/ADMIN 세팅) */
+/**
+ * studio_class_schedule.status
+ * 수업 상태머신: OPEN → STARTED → COMPLETED (배치가 전이).
+ * CLOSED(마감)·HOLD(처리 중)·CANCELLED(취소)는 PARTNER/ADMIN 세팅. CLOSED 는 종료 후 COMPLETED 가 된다.
+ */
 export const ScheduleStatus = {
   OPEN: 'OPEN',
   STARTED: 'STARTED',
+  CLOSED: 'CLOSED',
   HOLD: 'HOLD',
+  CANCELLED: 'CANCELLED',
   COMPLETED: 'COMPLETED',
 } as const;
 
