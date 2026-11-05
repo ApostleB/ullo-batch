@@ -29,4 +29,22 @@ export class MemberClassSession {
 
   @Column({ type: 'integer', nullable: true })
   credit_amount: number | null;
+
+  // 취소 추적 (ullo 백엔드 엔티티와 같은 물리 컬럼 — 배치 로직은 쓰지 않는다)
+  @Column({ type: 'timestamp', nullable: true })
+  cancelled_at: Date | null;
+
+  // MEMBER | PARTNER | ADMIN | SYSTEM
+  @Column({ type: 'text', nullable: true })
+  cancelled_by_type: string | null;
+
+  @Column({ type: 'uuid', nullable: true })
+  cancelled_by_id: string | null;
+
+  // POLICY_VIOLATION | PAYMENT_ISSUE | SAFETY | ETC | CENTER_REQUEST
+  @Column({ type: 'text', nullable: true })
+  cancel_reason_code: string | null;
+
+  @Column({ type: 'text', nullable: true })
+  cancel_reason_detail: string | null;
 }
