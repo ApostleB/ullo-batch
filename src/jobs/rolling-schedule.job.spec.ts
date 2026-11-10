@@ -192,4 +192,23 @@ describe('rolling-schedule — 생성 값', () => {
     await execute(log);
     expect(saved[0]).toMatchObject({ status: 'OPEN', current_capacity: 0, is_del: IsYn.N });
   });
+
+  it('시간표 강사가 있으면 모든 회차에 복사한다(ullo 롤링 생성기와 같음)', async () => {
+    setup({ timeTables: [timeTable({ instructor_id: 'ins-1' })] });
+    await execute(log);
+    expect(saved.length).toBeGreaterThan(0);
+    saved.forEach((r) => expect(r.instructor_id).toBe('ins-1'));
+  });
+
+  it('시간표 강사가 없으면(null·미지정) 회차 강사는 null', async () => {
+    setup({ timeTables: [timeTable({ instructor_id: null })] });
+    await execute(log);
+    expect(saved.length).toBeGreaterThan(0);
+    saved.forEach((r) => expect(r.instructor_id).toBeNull());
+
+    setup(); // instructor_id 키 자체가 없는 행
+    await execute(log);
+    expect(saved.length).toBeGreaterThan(0);
+    saved.forEach((r) => expect(r.instructor_id).toBeNull());
+  });
 });

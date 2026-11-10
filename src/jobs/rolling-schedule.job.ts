@@ -134,6 +134,8 @@ async function rollOne(
           end_time: slot.end,
           current_capacity: 0,
           max_capacity: capacity,
+          // 시간표 강사를 회차에 복사(ullo common/schedule/rolling-schedule.generator.ts 와 같음)
+          instructor_id: tt.instructor_id ?? null,
           status: 'OPEN',
           is_del: IsYn.N,
           created_at: new Date(),
