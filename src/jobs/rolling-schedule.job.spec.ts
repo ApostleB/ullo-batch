@@ -12,7 +12,7 @@ jest.mock('../db/data-source', () => ({
 }));
 jest.mock('../config', () => ({ config: { params: { rollingHorizonDays: 14 } } }));
 
-import { execute } from './rolling-schedule.job';
+import { execute, JOB_NAME } from './rolling-schedule.job';
 import { addDays, dowCode, ymd } from '../utils/date.util';
 
 const log: any = { info: jest.fn(), warn: jest.fn(), error: jest.fn() };
@@ -74,6 +74,14 @@ beforeEach(() => jest.clearAllMocks());
 
 /** 생성된 날짜 집합 */
 const dates = () => Array.from(new Set(saved.map((r) => ymd(new Date(r.scheduled_date))))).sort();
+
+describe('rolling-schedule — ullo 와의 잠금 키', () => {
+  it("잡 이름은 ullo 의 advisory lock 키 'rolling-schedule' 과 같다(runJob 세션 잠금으로 직렬화)", () => {
+    // runJob 이 pg_try_advisory_lock(hashtext(JOB_NAME)) 을 잡 전체 동안 쥔다.
+    // ullo: pg_advisory_xact_lock(hashtext('rolling-schedule')) — 이름이 바뀌면 직렬화가 조용히 깨진다.
+    expect(JOB_NAME).toBe('rolling-schedule');
+  });
+});
 
 describe('rolling-schedule — 슬롯 분할', () => {
   it('10:00~12:00 / 60분 / 휴식 0 → 2슬롯', async () => {

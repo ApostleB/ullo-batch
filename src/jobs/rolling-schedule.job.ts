@@ -10,6 +10,18 @@ import { config } from '../config';
 import { addDays, dowCode, DOW_CODES, toLocalDate, toMinutes, toTimeString, today, ymd } from '../utils/date.util';
 import { createJobLogger } from '../logger';
 
+/**
+ * 잡 이름은 ullo 와의 동시 생성 직렬화 키이기도 하다 — 바꾸지 말 것.
+ *
+ * `runJob()`(utils/run-job.ts)이 잡 전체 동안 별도 커넥션에서
+ * `pg_try_advisory_lock(hashtext(JOB_NAME))` 세션 잠금을 쥔다. ullo 의 슬롯 저장·재활성화·
+ * 어드민 수동 재생성은 같은 키 `pg_advisory_xact_lock(hashtext('rolling-schedule'))` 를 잡으므로
+ * (세션·트랜잭션 advisory lock 은 같은 키 공간), 배치가 도는 동안 ullo 쪽은 배치가 끝나고
+ * 잠금을 풀 때까지 기다리고, ullo 가 잠금을 쥔 순간에 배치가 시작되면 배치가 그 회를 건너뛴다.
+ *
+ * 이 잡 안에서 같은 키로 `pg_advisory_xact_lock` 을 다시 잡으면 안 된다: 트랜잭션은 풀의 다른
+ * 커넥션이라 runJob 이 쥔 세션 잠금을 영원히 기다린다(자기 교착 → 잡 정지 + ullo 저장도 정지).
+ */
 export const JOB_NAME = 'rolling-schedule';
 
 type Log = ReturnType<typeof createJobLogger>;
