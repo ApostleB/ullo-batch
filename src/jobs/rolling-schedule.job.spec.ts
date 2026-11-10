@@ -7,8 +7,13 @@
 import { ActiveStatus, IsYn } from '../entities/enums';
 
 const repos: Record<string, any> = {};
+/** studio_instructor raw SQL 조회(W6f) — 테스트마다 setup 이 반환값을 정한다 */
+const query = jest.fn();
 jest.mock('../db/data-source', () => ({
-  AppDataSource: { getRepository: (e: { name: string }) => repos[e.name] },
+  AppDataSource: {
+    getRepository: (e: { name: string }) => repos[e.name],
+    query: (...args: unknown[]) => query(...args),
+  },
 }));
 jest.mock('../config', () => ({ config: { params: { rollingHorizonDays: 14 } } }));
 
@@ -46,8 +51,12 @@ function setup(opts: {
   repeatDays?: string[];
   existing?: string[];
   holidays?: string[];
+  /** studio_instructor 행(없으면 null). 기본은 재직 중 강사 */
+  instructor?: { is_del: string | null; employment_status: string | null } | null;
 } = {}) {
   saved.length = 0;
+  const inst = 'instructor' in opts ? opts.instructor : { is_del: IsYn.N, employment_status: 'EMPLOYED' };
+  query.mockReset().mockResolvedValue(inst ? [inst] : []);
   repos.ClassTimeTable = { find: jest.fn().mockResolvedValue(opts.timeTables ?? [timeTable()]) };
   repos.StudioClass = {
     find: jest.fn().mockResolvedValue([
@@ -218,5 +227,84 @@ describe('rolling-schedule — 생성 값', () => {
     await execute(log);
     expect(saved.length).toBeGreaterThan(0);
     saved.forEach((r) => expect(r.instructor_id).toBeNull());
+  });
+});
+
+describe('rolling-schedule — 퇴사·삭제 강사 복사 제외(W6f, ullo resolveCopyInstructor 와 같음)', () => {
+  const run = async (instructor: { is_del: string | null; employment_status: string | null } | null) => {
+    setup({ timeTables: [timeTable({ instructor_id: 'ins-1' })], instructor });
+    await execute(log);
+    expect(saved.length).toBeGreaterThan(0);
+    // 시간표 한 건당 조회 1회, 강사 id 로만 조회
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(query.mock.calls[0][0]).toContain('FROM studio_instructor');
+    expect(query.mock.calls[0][1]).toEqual(['ins-1']);
+    return saved.map((r) => r.instructor_id);
+  };
+
+  it('퇴사(RESIGNED) 강사 → 새 회차 강사 NULL', async () => {
+    (await run({ is_del: IsYn.N, employment_status: 'RESIGNED' })).forEach((v) => expect(v).toBeNull());
+  });
+
+  it("삭제(is_del='Y') 강사 → NULL", async () => {
+    (await run({ is_del: IsYn.Y, employment_status: 'EMPLOYED' })).forEach((v) => expect(v).toBeNull());
+  });
+
+  it('강사 행이 없으면 → NULL', async () => {
+    (await run(null)).forEach((v) => expect(v).toBeNull());
+  });
+
+  it('재직(EMPLOYED) 강사 → 복사', async () => {
+    (await run({ is_del: IsYn.N, employment_status: 'EMPLOYED' })).forEach((v) => expect(v).toBe('ins-1'));
+  });
+
+  it('휴직(ON_LEAVE) 강사 → 복사', async () => {
+    (await run({ is_del: IsYn.N, employment_status: 'ON_LEAVE' })).forEach((v) => expect(v).toBe('ins-1'));
+  });
+
+  it("운영팀 정지(is_active='N') 강사 → 복사(조회 컬럼에 is_active 가 없고 판단에 쓰지 않음)", async () => {
+    const row = { is_del: IsYn.N, employment_status: 'EMPLOYED', is_active: 'N' } as any;
+    (await run(row)).forEach((v) => expect(v).toBe('ins-1'));
+  });
+
+  it('is_del 이 NULL 인 강사는 삭제로 보지 않는다 → 복사', async () => {
+    (await run({ is_del: null, employment_status: 'EMPLOYED' })).forEach((v) => expect(v).toBe('ins-1'));
+  });
+
+  it('시간표 강사가 없으면 조회하지 않고 NULL', async () => {
+    setup({ timeTables: [timeTable({ instructor_id: null })] });
+    await execute(log);
+    expect(saved.length).toBeGreaterThan(0);
+    saved.forEach((r) => expect(r.instructor_id).toBeNull());
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it('기존 회차·시간표는 바꾸지 않는다(새 회차 insert 만, 기존 날짜는 건너뜀)', async () => {
+    setup({
+      timeTables: [timeTable({ instructor_id: 'ins-1' })],
+      repeatDays: [dow(1), dow(2)],
+      existing: [day(1)],
+      instructor: { is_del: IsYn.N, employment_status: 'RESIGNED' },
+    });
+    await execute(log);
+    expect(dates()).not.toContain(day(1));
+    // 쓰기는 ClassSchedule.save(새 행) 뿐 — update·시간표 저장·UPDATE SQL 없음
+    expect(repos.ClassSchedule.update).toBeUndefined();
+    expect(repos.ClassTimeTable.save).toBeUndefined();
+    query.mock.calls.forEach(([sql]) => expect(String(sql)).toMatch(/^\s*SELECT/i));
+    saved.forEach((r) => expect(r.instructor_id).toBeNull());
+  });
+
+  it('시간표가 여러 건이면 시간표마다 1회씩만 조회한다', async () => {
+    setup({
+      timeTables: [
+        timeTable({ class_time_table_id: 'tt1', instructor_id: 'ins-1' }),
+        timeTable({ class_time_table_id: 'tt2', instructor_id: 'ins-2' }),
+      ],
+      repeatDays: ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'],
+    });
+    await execute(log);
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(query.mock.calls.map((c) => c[1])).toEqual([['ins-1'], ['ins-2']]);
   });
 });

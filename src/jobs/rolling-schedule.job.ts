@@ -80,6 +80,25 @@ export async function execute(log: Log): Promise<void> {
   log.info(`스케줄 생성: 총 ${createdTotal}건`);
 }
 
+/**
+ * 새 회차에 복사할 시간표 강사(W6f, 사용자 결정 A안 2026-11-11).
+ * ullo common/schedule/rolling-schedule.generator.ts 의 resolveCopyInstructor 와 같은 규칙 — 한쪽을 바꾸면 함께 바꾼다:
+ * 강사 행(studio_instructor)이 없거나 is_del='Y' 거나 employment_status='RESIGNED' 면 NULL,
+ * 그 밖(재직·휴직 ON_LEAVE·운영팀 정지 is_active≠'Y')은 그대로 복사한다.
+ * 시간표 한 건당 조회 1회(강사 없는 시간표는 조회하지 않음). 기존 회차·시간표 값은 바꾸지 않는다.
+ * 배치에는 studio_instructor 엔티티가 없어 raw SQL 로 읽는다(advisory lock 은 잡지 않는다 — JOB_NAME 주석 참고).
+ */
+async function resolveCopyInstructor(instructorId: string | null): Promise<string | null> {
+  if (!instructorId) return null;
+  const rows: { is_del: string | null; employment_status: string | null }[] = await AppDataSource.query(
+    `SELECT is_del, employment_status FROM studio_instructor WHERE instructor_id = $1`,
+    [instructorId],
+  );
+  const inst = rows[0];
+  if (!inst || inst.is_del === IsYn.Y || inst.employment_status === 'RESIGNED') return null;
+  return instructorId;
+}
+
 async function rollOne(
   tt: ClassTimeTable,
   cls: StudioClass,
@@ -130,6 +149,7 @@ async function rollOne(
   const slots = buildSlots(tt.start_time!, tt.end_time!, tt.duration!, tt.break_time ?? 0);
   if (slots.length === 0) return 0;
   const capacity = tt.max_capacity ?? cls.max_capacity ?? null;
+  const instructorId = await resolveCopyInstructor(tt.instructor_id ?? null);
 
   const rows: ClassSchedule[] = [];
   for (let d = new Date(from); d <= to; d = addDays(d, 1)) {
@@ -146,8 +166,8 @@ async function rollOne(
           end_time: slot.end,
           current_capacity: 0,
           max_capacity: capacity,
-          // 시간표 강사를 회차에 복사(ullo common/schedule/rolling-schedule.generator.ts 와 같음)
-          instructor_id: tt.instructor_id ?? null,
+          // 시간표 강사를 회차에 복사(W9c). 퇴사·삭제·없는 강사는 NULL(W6f) — resolveCopyInstructor
+          instructor_id: instructorId,
           status: 'OPEN',
           is_del: IsYn.N,
           created_at: new Date(),
