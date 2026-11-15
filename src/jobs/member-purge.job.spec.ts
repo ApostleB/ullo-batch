@@ -180,8 +180,9 @@ describe('member-purge — 파트너 회원 메모 물리 삭제(W5c)', () => {
 
     // UPDATE ... RETURNING member_id 로 이번에 N→Y 된 회원을 얻는다
     expect(qb.returning).toHaveBeenCalledWith(['member_id']);
-    // 메모 → 신고(W8f) → 회원 정보 수정 요청(W8f) 순서로 3번
-    expect(runner.query).toHaveBeenCalledTimes(3);
+    // 메모 → 신고(W8f) → 회원 정보 수정 요청(W8f) 순서로 DELETE 3번 + W10f 테이블 확인 1번(목은 테이블 없음 → UPDATE 없음)
+    expect(runner.query).toHaveBeenCalledTimes(4);
+    expect(runner.query.mock.calls.filter(([q]: [string]) => q.startsWith('DELETE'))).toHaveLength(3);
     const [sql, params] = runner.query.mock.calls[0];
     expect(sql).toMatch(/^DELETE FROM partner_member_memo WHERE member_id = ANY\(\$1::uuid\[\]\)$/);
     expect(sql).not.toMatch(/is_del/); // 소프트 삭제된 메모도 함께 물리 삭제
@@ -262,6 +263,7 @@ describe('member-purge — 회원 신고·회원 정보 수정 요청 물리 삭
       if (sql.includes('partner_member_memo')) return { records: [], affected: counts.memo };
       if (sql.includes('partner_member_report')) return { records: [], affected: counts.report };
       if (sql.includes('partner_edit_request')) return { records: [], affected: counts.edit };
+      if (sql.includes('to_regclass')) return { records: [] }; // W10f 테이블 없음 — 회원 연결 해제 건너뜀
       throw new Error(`unexpected sql: ${sql}`);
     });
   }
@@ -318,7 +320,7 @@ describe('member-purge — 회원 신고·회원 정보 수정 요청 물리 삭
     });
     repo.createQueryBuilder = jest.fn(() => qb);
     runner.query = jest.fn(async (sql: string) => {
-      order.push(sql.split(' ')[2]);
+      order.push(sql.includes('to_regclass') ? 'to_regclass' : sql.split(' ')[2]);
       // 트랜잭션이 열려 있고 아직 커밋 전이다
       expect(tx).toEqual({ begun: 1, committed: 0, rolledBack: 0 });
       return { records: [], affected: 1 };
@@ -326,7 +328,7 @@ describe('member-purge — 회원 신고·회원 정보 수정 요청 물리 삭
 
     await execute(log);
 
-    expect(order).toEqual(['update', 'partner_member_memo', 'partner_member_report', 'partner_edit_request']);
+    expect(order).toEqual(['update', 'partner_member_memo', 'partner_member_report', 'partner_edit_request', 'to_regclass']);
     expect(tx).toEqual({ begun: 1, committed: 1, rolledBack: 0 });
   });
 
@@ -376,6 +378,131 @@ describe('member-purge — 회원 신고·회원 정보 수정 요청 물리 삭
     expect(qb.execute).toHaveBeenCalledTimes(1);
     expect(tx).toEqual({ begun: 1, committed: 0, rolledBack: 1 });
     expect(log.info).not.toHaveBeenCalledWith(expect.stringContaining('파기 완료'));
+  });
+});
+
+describe('member-purge — 파트너 활동 로그·알림 회원 연결 해제(W10f)', () => {
+  /** SQL 별 목 — present: to_regclass 가 "있다"고 답할 테이블 */
+  function mockDb(present: string[], updated: Record<string, number> = {}) {
+    runner.query = jest.fn(async (sql: string, params: unknown[]) => {
+      if (sql.includes('to_regclass')) {
+        const names = params[0] as string[];
+        return { records: names.filter((n) => present.includes(n)).map((name) => ({ name })) };
+      }
+      if (sql.startsWith('UPDATE')) {
+        const table = sql.split(' ')[1];
+        return { records: [], affected: updated[table] ?? 0 };
+      }
+      if (sql.startsWith('DELETE')) return { records: [], affected: 0 };
+      throw new Error(`unexpected sql: ${sql}`);
+    });
+  }
+  const updates = () => runner.query.mock.calls.filter(([q]: [string]) => q.startsWith('UPDATE'));
+
+  it('두 테이블이 있으면 이번 파기 회원의 subject_member_id 를 NULL 로 바꾼다(행은 지우지 않는다)', async () => {
+    repo.count = jest.fn().mockResolvedValue(2);
+    const { qb } = makeQb(2, ['mem-a', 'mem-b']);
+    repo.createQueryBuilder = jest.fn(() => qb);
+    mockDb(['partner_activity_log', 'partner_notification'], { partner_activity_log: 7, partner_notification: 3 });
+
+    await execute(log);
+
+    const calls = updates();
+    expect(calls.map(([q]: [string]) => q)).toEqual([
+      'UPDATE partner_activity_log SET subject_member_id = NULL WHERE subject_member_id = ANY($1::uuid[])',
+      'UPDATE partner_notification SET subject_member_id = NULL WHERE subject_member_id = ANY($1::uuid[])',
+    ]);
+    calls.forEach(([, params, structured]: [string, unknown[], boolean]) => {
+      expect(params).toEqual([['mem-a', 'mem-b']]);
+      expect(structured).toBe(true);
+    });
+    // 두 테이블의 행을 지우는 SQL 은 없다
+    const deletes = runner.query.mock.calls.filter(([q]: [string]) => /DELETE FROM partner_(activity_log|notification)/.test(q));
+    expect(deletes).toHaveLength(0);
+    expect(tx).toEqual({ begun: 1, committed: 1, rolledBack: 0 });
+
+    const msg = log.info.mock.calls.map((c: unknown[]) => String(c[0])).join('\n');
+    expect(msg).toContain('활동 로그 회원 연결 해제 7건');
+    expect(msg).toContain('알림 회원 연결 해제 3건');
+    expect(msg).not.toContain('mem-a');
+  });
+
+  it('테이블 확인과 UPDATE 가 파기 UPDATE·DELETE 와 같은 트랜잭션에서 커밋 전에 실행된다', async () => {
+    repo.count = jest.fn().mockResolvedValue(1);
+    const { qb } = makeQb(1, ['mem-a']);
+    repo.createQueryBuilder = jest.fn(() => qb);
+    mockDb(['partner_activity_log', 'partner_notification']);
+    const inner = runner.query;
+    runner.query = jest.fn(async (sql: string, params: unknown[], s?: boolean) => {
+      expect(tx).toEqual({ begun: 1, committed: 0, rolledBack: 0 });
+      return inner(sql, params, s);
+    });
+
+    await execute(log);
+
+    expect(runner.query.mock.calls.some(([q]: [string]) => q.includes('to_regclass'))).toBe(true);
+    expect(runner.query.mock.calls.filter(([q]: [string]) => q.startsWith('UPDATE'))).toHaveLength(2);
+    expect(tx).toEqual({ begun: 1, committed: 1, rolledBack: 0 });
+  });
+
+  it('테이블이 없으면(W10 DDL 적용 전) UPDATE 를 건너뛰고 파기는 계속 진행해 커밋한다', async () => {
+    repo.count = jest.fn().mockResolvedValue(1);
+    const { qb } = makeQb(1, ['mem-a']);
+    repo.createQueryBuilder = jest.fn(() => qb);
+    mockDb([]);
+
+    await execute(log);
+
+    expect(updates()).toHaveLength(0);
+    // 파기 UPDATE·메모·신고·요청 DELETE 는 그대로 실행됐고 롤백되지 않았다
+    expect(qb.execute).toHaveBeenCalledTimes(1);
+    expect(runner.query.mock.calls.filter(([q]: [string]) => q.startsWith('DELETE'))).toHaveLength(3);
+    expect(tx).toEqual({ begun: 1, committed: 1, rolledBack: 0 });
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('partner_activity_log, partner_notification'));
+    expect(log.info).toHaveBeenCalledWith(expect.stringContaining('파기 완료'));
+  });
+
+  it('한 테이블만 있으면 그 테이블만 갱신한다', async () => {
+    repo.count = jest.fn().mockResolvedValue(1);
+    const { qb } = makeQb(1, ['mem-a']);
+    repo.createQueryBuilder = jest.fn(() => qb);
+    mockDb(['partner_activity_log'], { partner_activity_log: 2 });
+
+    await execute(log);
+
+    expect(updates().map(([q]: [string]) => q.split(' ')[1])).toEqual(['partner_activity_log']);
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('partner_notification'));
+    expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining('partner_activity_log'));
+    expect(tx).toEqual({ begun: 1, committed: 1, rolledBack: 0 });
+  });
+
+  it('테이블이 있는데 UPDATE 가 실패하면 파기 전체가 롤백된다(다음 실행에서 재시도)', async () => {
+    repo.count = jest.fn().mockResolvedValue(1);
+    const { qb } = makeQb(1, ['mem-a']);
+    repo.createQueryBuilder = jest.fn(() => qb);
+    mockDb(['partner_activity_log', 'partner_notification']);
+    const inner = runner.query;
+    runner.query = jest.fn(async (sql: string, params: unknown[], s?: boolean) => {
+      if (sql.startsWith('UPDATE partner_notification')) throw new Error('column "subject_member_id" does not exist');
+      return inner(sql, params, s);
+    });
+
+    await expect(execute(log)).rejects.toThrow('subject_member_id');
+
+    expect(tx).toEqual({ begun: 1, committed: 0, rolledBack: 1 });
+    expect(log.info).not.toHaveBeenCalledWith(expect.stringContaining('파기 완료'));
+  });
+
+  it('count 이후 경합으로 파기 UPDATE 가 0건이면 테이블 확인도 연결 해제도 하지 않는다', async () => {
+    repo.count = jest.fn().mockResolvedValue(1);
+    const { qb } = makeQb(0, []);
+    repo.createQueryBuilder = jest.fn(() => qb);
+    mockDb(['partner_activity_log', 'partner_notification']);
+
+    await execute(log);
+
+    expect(runner.query).not.toHaveBeenCalled();
+    expect(log.warn).not.toHaveBeenCalled();
   });
 });
 

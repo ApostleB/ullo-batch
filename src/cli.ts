@@ -10,6 +10,7 @@ import * as rolling from './jobs/rolling-schedule.job';
 import * as settlement from './jobs/auto-settlement.job';
 import * as holiday from './jobs/holiday.job';
 import * as memberPurge from './jobs/member-purge.job';
+import * as partnerDataPurge from './jobs/partner-data-purge.job';
 import * as sessionComplete from './jobs/session-complete.job';
 import * as creditExpiryNotice from './jobs/credit-expiry-notice.job';
 
@@ -22,6 +23,7 @@ const registry: Record<string, { name: string; execute: Exec }> = {
   settlement: { name: settlement.JOB_NAME, execute: settlement.execute },
   holiday: { name: holiday.JOB_NAME, execute: holiday.execute },
   'member-purge': { name: memberPurge.JOB_NAME, execute: memberPurge.execute },
+  'partner-data-purge': { name: partnerDataPurge.JOB_NAME, execute: partnerDataPurge.execute },
   'session-complete': { name: sessionComplete.JOB_NAME, execute: sessionComplete.execute },
   'credit-expiry-notice': { name: creditExpiryNotice.JOB_NAME, execute: creditExpiryNotice.execute },
 };

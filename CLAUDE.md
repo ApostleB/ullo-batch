@@ -22,6 +22,8 @@ npm run job session-complete # 수업 종료 세션 완료 처리
 npm run job billing         # 구독 정기결제 (스케줄러에서는 비활성)
 npm run job billing-retry   # 구독 결제 재시도 (스케줄러에서는 비활성)
 npm run job credit-expiry-notice  # 해지된 구독 크레딧 만료 15일 전 사전 안내 (스케줄러에서는 비활성)
+npm run job member-purge    # 탈퇴 회원 분리보관 개인정보 파기
+npm run job partner-data-purge  # 파트너 W10 데이터 보존 기간 파기 (게이트 PARTNER_DATA_PURGE_ENABLED)
 ```
 
 **PM2 배포:**
@@ -65,6 +67,8 @@ index.ts → AppDataSource.initialize() → scheduler/index.ts:startScheduler()
 | `auto-settlement` | `0 4 1 * *` (매월 1일 04:00) | 2 | 전월 완료 세션 집계 → Settlement 생성 (멱등) |
 | `holiday` | `0 2 1 * *` (매월 1일 02:00) | 3 | 공공데이터포털 특일정보 → Holiday upsert (`HOLIDAY_HORIZON_MONTHS`개월치) |
 | `session-complete` | `*/10 * * * *` (10분마다) | 1 | 수업 종료 처리 — ① `OPEN`→`STARTED`(시작시각 경과) ② 컷오프(종료시각, 미체크인 BOOKED 있으면 +1h 유예) 경과 수업 → `COMPLETED` + 세션 체크인→`COMPLETED`/미체크인→`NO_SHOW`. `HOLD`(PARTNER/ADMIN 세팅)는 skip. 설계: `docs/session-finalize-design.md` |
+| `member-purge` | `0 5 * * *` (매일 05:00) | 1 | 탈퇴 회원 분리보관 개인정보 파기 + 파트너 메모·신고·회원 정보 수정 요청 물리 삭제 + 파트너 활동 로그·알림 `subject_member_id` NULL(W10f, 테이블 있을 때만 — `to_regclass` 확인) |
+| `partner-data-purge` | `30 4 * * *` (매일 04:30) | 2 | 파트너 활동 로그 1년·알림 180일(읽음 행 먼저)·비밀번호 재설정 기록 30일 경과분을 1,000행씩 반복 삭제(raw SQL). 게이트 `PARTNER_DATA_PURGE_ENABLED`, 테이블 없으면 그 대상만 오류 로그 후 건너뜀. 아래 "파트너 데이터 보존 기간 파기" |
 | `subscription-billing` | `0 21 * * *` | 0 | 구독 정기결제 — **스케줄러에서 주석 처리(비활성)** |
 | `subscription-billing-retry` | `0 20 * * *` | 0 | 전일 실패(PAST_DUE) **1회** 재시도, 재시도도 실패하면 구독 해지 — **비활성** |
 | `credit-expiry-notice` | `0 10 * * *` (매일 10:00) | 0 | 해지된 구독에서 지급된 크레딧의 만료 15일 전 사전 안내(카카오 스텁 기록) — **비활성**, 게이트 `CREDIT_EXPIRY_NOTICE_ENABLED` |
@@ -117,6 +121,15 @@ billing 2종과 `credit-expiry-notice`는 `scheduler/index.ts`에서 주석 처�
 - **발송:** 해지 알림과 같은 스텁 기록(`recordKakaoStubNotice` — `manager.transaction` SAVEPOINT 로 실패 격리, 실패 시 `[NOTIFY_FAILED]` 로그 + 기록 없음이라 다음 실행에서 재시도). 카카오 호출·실제 발송은 없고 앱 알림 목록에는 보이지 않는다(category=`KAKAO_STUB`). 문구(`utils/credit-expiry-notice.util.ts`)는 남은 크레딧 수·만료일·남은 일수만 넣고 금액·키 등 민감값은 넣지 않는다.
 - **재현 옵션:** `--as-of YYYY-MM-DD`/`--member <id>` 를 billing 잡과 같은 안전장치(N-8: 비운영 `NODE_ENV`·로컬 `DANAL_API_BASE_URL`·`BILLING_TEST_DB_CONFIRM`)로 허용한다. 예: `NODE_ENV=local BILLING_TEST_DB_CONFIRM=127.0.0.1/ullo_test DANAL_API_BASE_URL=http://localhost:3999 npm run job credit-expiry-notice -- --as-of 2026-11-18 --member <id>`.
 
+### 파트너 데이터 보존 기간 파기 — `jobs/partner-data-purge.job.ts` (W10f)
+
+보존 기간(W10 DQ-5, 2026-11-13 확정): 활동 로그 1년 · 콘솔 알림 180일 · 비밀번호 재설정 기록 30일.
+
+- **운영 게이트:** `PARTNER_DATA_PURGE_ENABLED` 가 정확히 `'true'` 일 때만 DB 에 연결·삭제한다(기본 꺼짐, CLI 수동 실행도 같다). 스케줄러에는 등록돼 있어 꺼져 있으면 매일 "꺼져 있음" 로그만 남는다. **W10 DDL(ullo `docs/ddl/2026-11-13_partner_w10_activity_notification_reset.sql`) 적용 뒤에만** 켠다. cron `JOB_PARTNER_DATA_PURGE_CRON`(기본 `30 4 * * *`).
+- **삭제:** 대상마다 `created_at < now() - interval '…'` 를 `ORDER BY created_at LIMIT 1000` 으로 골라 지우고, 1,000건을 꽉 채우면 다음 배치를 돈다(한 실행 대상당 최대 10,000배치). 알림은 배치마다 트랜잭션으로 ID 를 고른 뒤 `partner_notification_read` → `partner_notification` 순서로 같은 ID 를 지운다. 배치마다 커밋하므로 실패해도 지운 만큼은 남고 재시도·다음 실행이 이어 지운다.
+- **테이블 없음:** `to_regclass`(`utils/table-exists.util.ts`)로 먼저 확인해 없는 테이블이 낀 대상은 `[PARTNER_PURGE_TABLE_MISSING]` 오류 로그만 남기고 건너뛴다(예외 없음 → 재시도·다른 잡 영향 없음). 읽음 테이블만 없어도 알림은 지우지 않는다.
+- **회원 파기 연동:** `member-purge` 가 같은 트랜잭션에서 파기 회원의 `partner_activity_log`·`partner_notification` `subject_member_id` 를 NULL 로 바꾼다(행은 남김). W5c·W8f 의 DELETE 와 달리 `to_regclass` 로 테이블이 있을 때만 실행해 DDL 전에도 파기가 멈추지 않는다.
+
 ### 반드시 알아야 할 공통 규칙
 
 - **프로세스 시간대 [D-3]:** `today()`·`ymd()`·node-schedule cron(`0 21 * * *` 등)이 모두 프로세스 로컬 시간이라 `src/utils/timezone.ts` 가 `process.env.TZ='Asia/Seoul'` 로 고정한다 — `index.ts`·`cli.ts` 의 **첫 import**(다른 모듈이 Date 를 쓰기 전)여야 하고 `ecosystem.config.js` 의 `env.TZ` 로도 고정한다. 새 진입점은 첫 import 로 넣을 것. `src/utils/timezone.spec.ts` 가 `TZ=UTC` 자식 프로세스로 KST 날짜·cron 시각을 검증한다.
@@ -139,6 +152,7 @@ billing 2종과 `credit-expiry-notice`는 `scheduler/index.ts`에서 주석 처�
 - `src/utils/credit-expiry-notice.util.ts`: 크레딧 만료 안내 문구·멱등 키(link)·`daysBetween`
 - `src/utils/subscription-cancel-notice.util.ts`: 구독 해지 알림 문구·`recordSubscriptionCancelNotice`(KAKAO_STUB 기록, 백엔드 복제)
 - `src/utils/subscription-cycle.util.ts`: 주기 키·시도 번호·`classifyCycle`·다음 결제일 규칙(`nextChargeDateFrom`: 실제 청구일 + 1개월) (백엔드 복제)
+- `src/utils/table-exists.util.ts`: `existingTables` — `to_regclass` 로 테이블 존재 확인(트랜잭션을 깨뜨리지 않음, W10f)
 - `src/utils/environment.util.ts`: `isExplicitNonProduction` — 운영 판단 기준(N-9)
 - `src/utils/test-options.ts`: 재현 전용 CLI 옵션 검증(N-8)
 - `src/utils/toss-billing.client.ts`: 토스 빌링키 자동결제 클라이언트. **구독 청구 잡은 더 이상 호출하지 않는다**(PG 전환 원칙) — 사용처가 없다
@@ -152,6 +166,7 @@ billing 2종과 `credit-expiry-notice`는 `scheduler/index.ts`에서 주석 처�
 |---|---|---|
 | `NODE_ENV` | (미주입) | 실행 환경. `local`·`development`·`dev`·`test` 만 비운영, 그 외·미주입은 운영으로 본다(테스트 키 방어, 재현 옵션). `config.env` 는 미주입 시 `local` |
 | `CREDIT_EXPIRY_NOTICE_ENABLED` | 꺼짐 | 크레딧 만료 사전 안내 게이트 (정확히 `true` 일 때만 조회·기록) |
+| `PARTNER_DATA_PURGE_ENABLED` | 꺼짐 | 파트너 W10 데이터 보존 기간 파기 게이트 (정확히 `true` 일 때만 삭제, W10 DDL 적용 뒤에만) |
 | `BILLING_TEST_DB_CONFIRM` | (없음) | 재현 옵션(`--as-of`/`--member`) 전용: `DB_HOST/DB_NAME` 과 정확히 같아야 한다 |
 | `DB_HOST/PORT/NAME/USERNAME/PASSWORD` | 127.0.0.1 / 5432 / ullo / ullo / '' | PostgreSQL 접속 정보 |
 | `TOSS_SECRET_KEY` | '' | (미사용) 구독 청구 잡이 토스를 호출하지 않는다 |
@@ -161,7 +176,7 @@ billing 2종과 `credit-expiry-notice`는 `scheduler/index.ts`에서 주석 처�
 | `BILLING_KEY_ENC_KEY` | '' | member_billing.billing_key 복호화 키 (백엔드와 동일) |
 | `PUBLIC_DATA_API_KEY` | '' | 공공데이터포털 서비스키(디코딩 값, 공휴일 잡) |
 | `LOG_LEVEL` / `LOG_DIR` | info / logs | 로그 레벨·디렉터리 |
-| `JOB_*_CRON` | config 하드코딩 | 각 잡 cron (`JOB_ROLLING_SCHEDULE_CRON`, `JOB_AUTO_SETTLEMENT_CRON`, `JOB_HOLIDAY_CRON`, `JOB_BILLING_CRON`, `JOB_BILLING_RETRY_CRON`, `JOB_CREDIT_EXPIRY_NOTICE_CRON`, `JOB_HEALTH_CHECK`) |
+| `JOB_*_CRON` | config 하드코딩 | 각 잡 cron (`JOB_ROLLING_SCHEDULE_CRON`, `JOB_AUTO_SETTLEMENT_CRON`, `JOB_HOLIDAY_CRON`, `JOB_BILLING_CRON`, `JOB_BILLING_RETRY_CRON`, `JOB_CREDIT_EXPIRY_NOTICE_CRON`, `JOB_MEMBER_PURGE_CRON`, `JOB_PARTNER_DATA_PURGE_CRON`, `JOB_HEALTH_CHECK`) |
 | `ROLLING_HORIZON_DAYS` | 30 | 스케줄 선행 생성 일수 |
 | `HOLIDAY_HORIZON_MONTHS` | 3 | 공휴일 동기화 대상 개월 수(현재 월 포함) |
 | `SETTLEMENT_DEFAULT_UNIT_PRICE` | 10000 | 정산 기본 단가 (정책 없을 때) |

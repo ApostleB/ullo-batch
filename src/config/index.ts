@@ -52,6 +52,10 @@ export const config = {
     // 크레딧 만료 15일 전 사전 안내 게이트 — 정확히 'true' 일 때만 조회·기록한다(기본 꺼짐)
     noticeEnabled: process.env.CREDIT_EXPIRY_NOTICE_ENABLED === 'true',
   },
+  partnerDataPurge: {
+    // 파트너 W10 데이터 보존 기간 파기 게이트 — 정확히 'true' 일 때만 조회·삭제한다(기본 꺼짐). W10 DDL 적용 뒤에만 켠다
+    enabled: process.env.PARTNER_DATA_PURGE_ENABLED === 'true',
+  },
   inicis: {
     // 빌링(구독) MID 의 자격 — 일반결제(INICIS_MID/INIAPI_KEY)와 다르다 (테스트: INIBillTst)
     billMid: process.env.INICIS_BILL_MID ?? '',
@@ -80,6 +84,7 @@ export const config = {
     systemHealthCheck: { cron: process.env.JOB_HEALTH_CHECK ?? '* * * * *' },
     holiday: { cron: process.env.JOB_HOLIDAY_CRON ?? '0 2 1 * *' }, // 매월 1일 02:00
     memberPurge: { cron: process.env.JOB_MEMBER_PURGE_CRON ?? '0 5 * * *' }, // 매일 05:00
+    partnerDataPurge: { cron: process.env.JOB_PARTNER_DATA_PURGE_CRON ?? '30 4 * * *' }, // 매일 04:30
     sessionComplete: { cron: process.env.JOB_SESSION_COMPLETE_CRON ?? '*/10 * * * *' }, // 10분마다
   },
   params: {

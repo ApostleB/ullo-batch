@@ -3,8 +3,12 @@ import { AppDataSource } from '../db/data-source';
 import { MemberWithdrawal } from '../entities/member-withdrawal.entity';
 import { IsYn } from '../entities/enums';
 import { createJobLogger } from '../logger';
+import { existingTables } from '../utils/table-exists.util';
 
 export const JOB_NAME = 'member-purge';
+
+/** W10f: 파기 회원의 subject_member_id 를 NULL 로 바꾸는 테이블(행은 지우지 않는다 — 문구에 회원 정보가 없다) */
+export const SUBJECT_MEMBER_TABLES = ['partner_activity_log', 'partner_notification'] as const;
 
 type Log = ReturnType<typeof createJobLogger>;
 
@@ -28,6 +32,12 @@ type Log = ReturnType<typeof createJobLogger>;
  * (member_id, request_type)에 의존하므로 백엔드가 이름을 바꾸면 이 SQL 도 고쳐야 한다.
  * ⚠️ W8 DDL(ullo docs/ddl/2026-11-10_partner_review_report_inquiry_content.sql) 적용 후에만 배포한다.
  *
+ * 같은 트랜잭션에서 파트너 활동 로그(partner_activity_log)·콘솔 알림(partner_notification)의
+ * subject_member_id 를 NULL 로 바꾼다(W10f, W10 설계 4-2절). 행은 남긴다(요약·제목에 회원 정보가 없다).
+ * W5c·W8f 와 달리 테이블이 없어도 파기를 멈추지 않도록 to_regclass 로 먼저 확인하고 있는 테이블만 갱신한다
+ * (to_regclass 는 없는 이름에 NULL 을 돌려줄 뿐 오류를 내지 않아 트랜잭션을 깨뜨리지 않는다).
+ * 테이블이 있는데 UPDATE 가 실패하면(컬럼·권한 문제) 다른 단계처럼 파기 전체가 롤백되고 다음 실행에서 재시도된다.
+ *
  * 멱등: is_purged=Y 는 다시 선택되지 않으므로 재실행·중복 실행에도 안전하다.
  */
 export async function execute(log: Log): Promise<void> {
@@ -42,7 +52,7 @@ export async function execute(log: Log): Promise<void> {
     return;
   }
 
-  const { purged, memosDeleted, reportsDeleted, editRequestsDeleted } = await AppDataSource.transaction(async (m) => {
+  const { purged, memosDeleted, reportsDeleted, editRequestsDeleted, subjectCleared } = await AppDataSource.transaction(async (m) => {
     const res = await m
       .getRepository(MemberWithdrawal)
       .createQueryBuilder()
@@ -67,7 +77,7 @@ export async function execute(log: Log): Promise<void> {
     const rows: Array<{ member_id: string }> = Array.isArray(res.raw) ? res.raw : [];
     const memberIds = [...new Set(rows.map((r) => r.member_id).filter(Boolean))];
     if (memberIds.length === 0) {
-      return { purged: res.affected ?? 0, memosDeleted: 0, reportsDeleted: 0, editRequestsDeleted: 0 };
+      return { purged: res.affected ?? 0, memosDeleted: 0, reportsDeleted: 0, editRequestsDeleted: 0, subjectCleared: {} };
     }
 
     // 같은 트랜잭션의 QueryRunner — useStructuredResult 로 삭제 건수(affected)를 받는다
@@ -88,17 +98,42 @@ export async function execute(log: Log): Promise<void> {
       [memberIds],
       true,
     );
+
+    // W10f: 활동 로그·알림의 회원 연결만 끊는다. 테이블이 없으면(W10 DDL 적용 전) 건너뛰고 파기는 계속한다
+    const present = await existingTables(m.queryRunner!, SUBJECT_MEMBER_TABLES);
+    const subjectCleared: Record<string, number | null> = {};
+    for (const table of SUBJECT_MEMBER_TABLES) {
+      if (!present.has(table)) {
+        subjectCleared[table] = null;
+        continue;
+      }
+      const upd = await m.queryRunner!.query(
+        `UPDATE ${table} SET subject_member_id = NULL WHERE subject_member_id = ANY($1::uuid[])`,
+        [memberIds],
+        true,
+      );
+      subjectCleared[table] = upd.affected ?? 0;
+    }
+
     return {
       purged: res.affected ?? rows.length,
       memosDeleted: del.affected ?? 0,
       reportsDeleted: delReports.affected ?? 0,
       editRequestsDeleted: delEditRequests.affected ?? 0,
+      subjectCleared,
     };
   });
+
+  const missingTables = SUBJECT_MEMBER_TABLES.filter((t) => subjectCleared[t] === null);
+  if (missingTables.length > 0) {
+    log.warn(`회원 연결 해제 건너뜀 — 테이블 없음: ${missingTables.join(', ')} (W10 DDL 적용 전). 파기는 계속 진행했다`);
+  }
 
   // member_id·메모 내용·신고 사유·요청 내용은 로그에 남기지 않는다(건수만)
   log.info(
     `분리보관 개인정보 파기 완료: 대상 ${targetCount} / 처리 ${purged}건, 파트너 회원 메모 삭제 ${memosDeleted}건, ` +
-      `회원 신고 삭제 ${reportsDeleted}건, 회원 정보 수정 요청 삭제 ${editRequestsDeleted}건`,
+      `회원 신고 삭제 ${reportsDeleted}건, 회원 정보 수정 요청 삭제 ${editRequestsDeleted}건, ` +
+      `활동 로그 회원 연결 해제 ${subjectCleared.partner_activity_log ?? 0}건, ` +
+      `알림 회원 연결 해제 ${subjectCleared.partner_notification ?? 0}건`,
   );
 }

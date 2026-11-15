@@ -8,6 +8,7 @@ import * as settlement from '../jobs/auto-settlement.job';
 import * as healthCheck from '../jobs/health-check.job';
 import * as holiday from '../jobs/holiday.job';
 import * as memberPurge from '../jobs/member-purge.job';
+import * as partnerDataPurge from '../jobs/partner-data-purge.job';
 import * as sessionComplete from '../jobs/session-complete.job';
 // import * as creditExpiryNotice from '../jobs/credit-expiry-notice.job';
 
@@ -73,6 +74,16 @@ export function startScheduler(): void {
     cron: config.jobs.memberPurge.cron,
     retries: 1,
     execute: memberPurge.execute,
+  });
+
+  // 파트너 W10 데이터 보존 기간 파기 — 매일 04:30 (활동 로그 1년·알림 180일·비밀번호 재설정 기록 30일).
+  // 게이트 PARTNER_DATA_PURGE_ENABLED=true 일 때만 삭제한다(기본 꺼짐 — 꺼져 있으면 로그만 남기고 끝).
+  // 배치마다 커밋하는 멱등 삭제라 재시도해도 안전하다.
+  registerJob(jobs, {
+    name: partnerDataPurge.JOB_NAME,
+    cron: config.jobs.partnerDataPurge.cron,
+    retries: 2,
+    execute: partnerDataPurge.execute,
   });
 
   // 수업 종료 처리 — 10분마다 (종료 시각 지난 BOOKED 세션 → COMPLETED)
