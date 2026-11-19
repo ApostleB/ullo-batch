@@ -106,3 +106,30 @@ describe('config.creditExpiry', () => {
     expect(load().creditExpiry.noticeEnabled).toBe(expected);
   });
 });
+
+/** config.params.holidayHorizonMonths — 공휴일 수집 범위(U-6 S28: 3 → 4개월, 예약 기간 최대 60일을 덮는다) */
+describe('config.params.holidayHorizonMonths', () => {
+  const saved = process.env.HOLIDAY_HORIZON_MONTHS;
+  afterEach(() => {
+    if (saved === undefined) delete process.env.HOLIDAY_HORIZON_MONTHS;
+    else process.env.HOLIDAY_HORIZON_MONTHS = saved;
+  });
+  const load = () => {
+    let cfg: typeof import('./index').config | undefined;
+    jest.isolateModules(() => {
+      cfg = require('./index').config;
+    });
+    return cfg!;
+  };
+
+  // 빈 문자열은 기본값이다(num()). dotenv 는 이미 있는 키를 덮어쓰지 않으므로 로컬 .env 의 영향을 받지 않는다.
+  it('기본값은 4개월(현재 월 포함) — 월말 기준 +60일(예: 12-31 → 3-1, 1-31 → 4-1)까지 덮는다', () => {
+    process.env.HOLIDAY_HORIZON_MONTHS = '';
+    expect(load().params.holidayHorizonMonths).toBe(4);
+  });
+
+  it('환경변수로 바꿀 수 있다', () => {
+    process.env.HOLIDAY_HORIZON_MONTHS = '6';
+    expect(load().params.holidayHorizonMonths).toBe(6);
+  });
+});

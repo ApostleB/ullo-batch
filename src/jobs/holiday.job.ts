@@ -20,8 +20,11 @@ function isChanged(row: Holiday, item: HolidayApiItem): boolean {
 
 /**
  * 공휴일 동기화 — 매월 실행.
- * 현재 월부터 HOLIDAY_HORIZON_MONTHS(기본 3)개월치를 API로 조회하여
+ * 현재 월부터 HOLIDAY_HORIZON_MONTHS(기본 4)개월치를 API로 조회하여
  * 신규는 insert, 기존은 변경분만 update, 동일하면 skip.
+ *
+ * 범위 4개월(U-6 S28): ullo 칸 계산이 공휴일 휴무 센터의 칸을 이 테이블로 거른다. 매월 1일 실행 기준으로
+ * 다음 실행 전날(월말)의 +60일(예약 기간 최대)까지 덮으려면 현재 월 + 3개월이 필요하다 — 예: 1-01 실행분이 1-31 + 60일 = 4-01 을 덮는다.
  */
 export async function execute(log: Log): Promise<void> {
   const horizon = config.params.holidayHorizonMonths;

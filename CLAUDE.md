@@ -175,7 +175,7 @@ billing 2종과 `credit-expiry-notice`는 `scheduler/index.ts`에서 주석 처�
 | `PUBLIC_DATA_API_KEY` | '' | 공공데이터포털 서비스키(디코딩 값, 공휴일 잡) |
 | `LOG_LEVEL` / `LOG_DIR` | info / logs | 로그 레벨·디렉터리 |
 | `JOB_*_CRON` | config 하드코딩 | 각 잡 cron (`JOB_AUTO_SETTLEMENT_CRON`, `JOB_HOLIDAY_CRON`, `JOB_BILLING_CRON`, `JOB_BILLING_RETRY_CRON`, `JOB_CREDIT_EXPIRY_NOTICE_CRON`, `JOB_MEMBER_PURGE_CRON`, `JOB_PARTNER_DATA_PURGE_CRON`, `JOB_HEALTH_CHECK`) |
-| `HOLIDAY_HORIZON_MONTHS` | 3 | 공휴일 동기화 대상 개월 수(현재 월 포함) |
+| `HOLIDAY_HORIZON_MONTHS` | 4 | 공휴일 동기화 대상 개월 수(현재 월 포함). U-6 S28: ullo 칸 계산(공휴일 휴무 센터)이 읽으므로 월말 기준 +60일(예약 기간 최대)을 덮도록 3 → 4 |
 | `SETTLEMENT_DEFAULT_UNIT_PRICE` | 10000 | 정산 기본 단가 (정책 없을 때) |
 | `SETTLEMENT_DEFAULT_COMMISSION_RATE` | 0.1 | 정산 기본 수수료율 (정책 없을 때) |
 

@@ -89,6 +89,6 @@ export const config = {
   params: {
     settlementDefaultUnitPrice: num(process.env.SETTLEMENT_DEFAULT_UNIT_PRICE, 10000),
     settlementDefaultCommissionRate: num(process.env.SETTLEMENT_DEFAULT_COMMISSION_RATE, 0.1),
-    holidayHorizonMonths: num(process.env.HOLIDAY_HORIZON_MONTHS, 3),
+    holidayHorizonMonths: num(process.env.HOLIDAY_HORIZON_MONTHS, 4), // U-6 S28: 월말 기준 +60일(예약 기간 최대)을 덮는다
   },
 } as const;

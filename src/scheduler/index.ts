@@ -51,7 +51,7 @@ export function startScheduler(): void {
     execute: settlement.execute,
   });
 
-  // 공휴일 동기화 — 매월 1일 02:00 (미래 3개월치 upsert)
+  // 공휴일 동기화 — 매월 1일 02:00 (현재 월 포함 4개월치 upsert, HOLIDAY_HORIZON_MONTHS)
   registerJob(jobs, {
     name: holiday.JOB_NAME,
     cron: config.jobs.holiday.cron,
