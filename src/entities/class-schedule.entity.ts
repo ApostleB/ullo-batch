@@ -1,6 +1,14 @@
-import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
+import { Column, Entity, Index, PrimaryGeneratedColumn } from 'typeorm';
 import { IsYn } from './enums';
 
+/**
+ * 칸 키 UNIQUE(U-6). DB 인덱스는 ullo docs/ddl/2026-11-18_u6_slot_on_booking.sql #3 이 만든다(synchronize 꺼짐 — 여기 선언은
+ * ullo 엔티티와 맞춘 문서용). ullo slot-materializer 의 ON CONFLICT 가 이 인덱스를 추론 대상으로 쓴다. 배치는 회차를 만들지 않는다.
+ */
+@Index('ux_studio_class_schedule_slot_key', ['class_time_table_id', 'scheduled_date', 'origin_start_time'], {
+  unique: true,
+  where: `"is_del" = 'N'`,
+})
 @Entity('studio_class_schedule')
 export class ClassSchedule {
   @PrimaryGeneratedColumn('uuid')
@@ -36,6 +44,15 @@ export class ClassSchedule {
   @Column({ type: 'time', nullable: true })
   end_time: string | null;
 
+  /**
+   * 원래 칸 시작 시각(U-6 칸 키 = 시간표·날짜·이 값). 회차 시각(start_time)을 옮겨도 바뀌지 않는다.
+   * 전환 기간에는 NULL 허용이고 DB BEFORE INSERT 트리거가 NULL 을 start_time 으로 채운다(S14).
+   * DDL: ullo docs/ddl/2026-11-18_u6_slot_on_booking.sql #2 (ullo ClassSchedule 엔티티와 같은 정의. 배치 잡은 이 값을 쓰지 않는다 —
+   * 이 DDL 적용 뒤에만 엔티티 전체 조회가 동작한다)
+   */
+  @Column({ type: 'time', nullable: true })
+  origin_start_time: string | null;
+
   @Column({ type: 'uuid', nullable: true })
   instructor_id: string | null;
 
@@ -53,7 +70,8 @@ export class ClassSchedule {
   @Column({ type: 'uuid', nullable: true })
   cancelled_by_id: string | null;
 
-  // POLICY_VIOLATION | PAYMENT_ISSUE | SAFETY | ETC | CENTER_REQUEST
+  // POLICY_VIOLATION | PAYMENT_ISSUE | SAFETY | ETC | CENTER_REQUEST | CLASS_HOLIDAY | CENTER_HOLIDAY
+  // (ullo CancelReasonCode 와 같은 값. CLASS_HOLIDAY·CENTER_HOLIDAY = 수업·센터 휴무, 어드민 날짜 일괄 취소·회차 취소 전용, U-6 S26)
   @Column({ type: 'text', nullable: true })
   cancel_reason_code: string | null;
 

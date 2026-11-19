@@ -41,7 +41,8 @@ export class MemberClassSession {
   @Column({ type: 'uuid', nullable: true })
   cancelled_by_id: string | null;
 
-  // POLICY_VIOLATION | PAYMENT_ISSUE | SAFETY | ETC | CENTER_REQUEST
+  // POLICY_VIOLATION | PAYMENT_ISSUE | SAFETY | ETC | CENTER_REQUEST | CLASS_HOLIDAY | CENTER_HOLIDAY
+  // (ullo CancelReasonCode 와 같은 값. CLASS_HOLIDAY·CENTER_HOLIDAY = 수업·센터 휴무, 어드민 날짜 일괄 취소·회차 취소 전용, U-6 S26)
   @Column({ type: 'text', nullable: true })
   cancel_reason_code: string | null;
 
