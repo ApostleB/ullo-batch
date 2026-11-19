@@ -3,7 +3,6 @@ import { logger } from '../logger';
 import { config } from '../config';
 import { registerJob } from './common';
 // import * as billing from '../jobs/subscription-billing.job';
-import * as rolling from '../jobs/rolling-schedule.job';
 import * as settlement from '../jobs/auto-settlement.job';
 import * as healthCheck from '../jobs/health-check.job';
 import * as holiday from '../jobs/holiday.job';
@@ -43,14 +42,6 @@ export function startScheduler(): void {
   //   retries: 0,
   //   execute: billing.executeRetry,
   // });
-
-  // 반복 스케줄 롤링 — 매일 03:00
-  registerJob(jobs, {
-    name: rolling.JOB_NAME,
-    cron: config.jobs.rollingSchedule.cron,
-    retries: 2,
-    execute: rolling.execute,
-  });
 
   // 정산 자동 생성 — 매월 1일 04:00
   registerJob(jobs, {

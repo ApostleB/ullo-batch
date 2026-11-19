@@ -15,7 +15,6 @@ npm run job <key>    # 잡 수동 단건 실행 (DB 연결 → 1회 실행 → �
 
 **수동 잡 실행 키** (`src/cli.ts`의 `registry`):
 ```bash
-npm run job rolling         # 반복 스케줄 롤링
 npm run job settlement      # 정산 자동 생성
 npm run job holiday         # 공휴일 동기화
 npm run job session-complete # 수업 종료 세션 완료 처리
@@ -63,7 +62,6 @@ index.ts → AppDataSource.initialize() → scheduler/index.ts:startScheduler()
 | 잡 (`JOB_NAME`) | cron 기본값 | retries | 설명 |
 |---|---|---|---|
 | `system-health-check` | `* * * * *` (매분) | 0 | 서비스 생존 확인 |
-| `rolling-schedule` | `0 3 * * *` (매일 03:00) | 2 | 반복 시간표 → ClassSchedule 선행 생성 (`ROLLING_HORIZON_DAYS`일치) |
 | `auto-settlement` | `0 4 1 * *` (매월 1일 04:00) | 2 | 전월 완료 세션 집계 → Settlement 생성 (멱등) |
 | `holiday` | `0 2 1 * *` (매월 1일 02:00) | 3 | 공공데이터포털 특일정보 → Holiday upsert (`HOLIDAY_HORIZON_MONTHS`개월치) |
 | `session-complete` | `*/10 * * * *` (10분마다) | 1 | 수업 종료 처리 — ① `OPEN`→`STARTED`(시작시각 경과) ② 컷오프(종료시각, 미체크인 BOOKED 있으면 +1h 유예) 경과 수업 → `COMPLETED` + 세션 체크인→`COMPLETED`/미체크인→`NO_SHOW`. `HOLD`(PARTNER/ADMIN 세팅)는 skip. 설계: `docs/session-finalize-design.md` |
@@ -72,6 +70,8 @@ index.ts → AppDataSource.initialize() → scheduler/index.ts:startScheduler()
 | `subscription-billing` | `0 21 * * *` | 0 | 구독 정기결제 — **스케줄러에서 주석 처리(비활성)** |
 | `subscription-billing-retry` | `0 20 * * *` | 0 | 전일 실패(PAST_DUE) **1회** 재시도, 재시도도 실패하면 구독 해지 — **비활성** |
 | `credit-expiry-notice` | `0 10 * * *` (매일 10:00) | 0 | 해지된 구독에서 지급된 크레딧의 만료 15일 전 사전 안내(카카오 스텁 기록) — **비활성**, 게이트 `CREDIT_EXPIRY_NOTICE_ENABLED` |
+
+> 회차(`studio_class_schedule`) 행을 미리 만들던 반복 스케줄 롤링 잡(`rolling-schedule`)은 U-6(U6-f)에서 폐지했다. 회차 행은 ullo 백엔드가 예약·materialize 때 만든다. 롤링만 쓰던 엔티티(`ClassTimeTable`·`ClassRepeatDay`·`ClassHoliday`)와 `date.util` 의 `toMinutes`·`toTimeString`·`dowCode`·`DOW_CODES` 는 지금 배치 잡이 쓰지 않는다(data-source 등록·함수는 남겨 둠).
 
 billing 2종과 `credit-expiry-notice`는 `scheduler/index.ts`에서 주석 처리되어 있으나 CLI(`npm run job billing`)로는 여전히 수동 실행 가능. 결제 잡은 건별로 try/catch·멱등 처리를 하므로 p-retry는 0.
 
@@ -133,13 +133,11 @@ billing 2종과 `credit-expiry-notice`는 `scheduler/index.ts`에서 주석 처�
 ### 반드시 알아야 할 공통 규칙
 
 - **프로세스 시간대 [D-3]:** `today()`·`ymd()`·node-schedule cron(`0 21 * * *` 등)이 모두 프로세스 로컬 시간이라 `src/utils/timezone.ts` 가 `process.env.TZ='Asia/Seoul'` 로 고정한다 — `index.ts`·`cli.ts` 의 **첫 import**(다른 모듈이 Date 를 쓰기 전)여야 하고 `ecosystem.config.js` 의 `env.TZ` 로도 고정한다. 새 진입점은 첫 import 로 넣을 것. `src/utils/timezone.spec.ts` 가 `TZ=UTC` 자식 프로세스로 KST 날짜·cron 시각을 검증한다.
-- **date 컬럼 UTC off-by-one**: TypeORM의 `date` 타입은 런타임에 `'YYYY-MM-DD'` 문자열로 온다. `new Date('YYYY-MM-DD')`는 UTC 자정으로 파싱되어 음수 오프셋(KST)에서 하루가 어긋난다. 날짜 비교/포맷 전에 반드시 `toLocalDate()`(문자열/Date 모두 로컬 자정으로 정규화)를 거칠 것. 이 규칙은 rolling-schedule·auto-settlement 전반에 걸쳐 있다.
+- **date 컬럼 UTC off-by-one**: TypeORM의 `date` 타입은 런타임에 `'YYYY-MM-DD'` 문자열로 온다. `new Date('YYYY-MM-DD')`는 UTC 자정으로 파싱되어 음수 오프셋(KST)에서 하루가 어긋난다. 날짜 비교/포맷 전에 반드시 `toLocalDate()`(문자열/Date 모두 로컬 자정으로 정규화)를 거칠 것. 이 규칙은 날짜 컬럼을 다루는 모든 잡(구독 청구·auto-settlement 등)에 적용된다.
 - **멱등성**은 모든 쓰기 잡의 핵심 (재시도·중복 실행 대비):
   - 정산: `(studio_id, period_start)` 중복이면 스킵
   - 결제: 다날은 `order_id = sub_{planId}_{YYYYMM}_{n}` + `CONFIRMING` 선점(주기 락)으로 중복 청구 차단.
   - 공휴일: `(locdate, seq)` 키로 insert/update/skip 분기
-  - 롤링: 이미 존재하는 `scheduled_date`는 재생성 안 함(삭제분 포함 → 되살리지 않음)
-- **롤링 요일 코드**: `ClassRepeatDay.day_of_week` 값이 `dowCode()`의 `SUN`..`SAT` 포맷과 다르면 매칭이 안 돼 조용히 0건 생성된다. rolling-schedule은 이 포맷 불일치를 감지해 `log.warn`으로 노출한다(`DOW_CODES` 검증).
 
 ### 주요 유틸
 
@@ -176,8 +174,7 @@ billing 2종과 `credit-expiry-notice`는 `scheduler/index.ts`에서 주석 처�
 | `BILLING_KEY_ENC_KEY` | '' | member_billing.billing_key 복호화 키 (백엔드와 동일) |
 | `PUBLIC_DATA_API_KEY` | '' | 공공데이터포털 서비스키(디코딩 값, 공휴일 잡) |
 | `LOG_LEVEL` / `LOG_DIR` | info / logs | 로그 레벨·디렉터리 |
-| `JOB_*_CRON` | config 하드코딩 | 각 잡 cron (`JOB_ROLLING_SCHEDULE_CRON`, `JOB_AUTO_SETTLEMENT_CRON`, `JOB_HOLIDAY_CRON`, `JOB_BILLING_CRON`, `JOB_BILLING_RETRY_CRON`, `JOB_CREDIT_EXPIRY_NOTICE_CRON`, `JOB_MEMBER_PURGE_CRON`, `JOB_PARTNER_DATA_PURGE_CRON`, `JOB_HEALTH_CHECK`) |
-| `ROLLING_HORIZON_DAYS` | 30 | 스케줄 선행 생성 일수 |
+| `JOB_*_CRON` | config 하드코딩 | 각 잡 cron (`JOB_AUTO_SETTLEMENT_CRON`, `JOB_HOLIDAY_CRON`, `JOB_BILLING_CRON`, `JOB_BILLING_RETRY_CRON`, `JOB_CREDIT_EXPIRY_NOTICE_CRON`, `JOB_MEMBER_PURGE_CRON`, `JOB_PARTNER_DATA_PURGE_CRON`, `JOB_HEALTH_CHECK`) |
 | `HOLIDAY_HORIZON_MONTHS` | 3 | 공휴일 동기화 대상 개월 수(현재 월 포함) |
 | `SETTLEMENT_DEFAULT_UNIT_PRICE` | 10000 | 정산 기본 단가 (정책 없을 때) |
 | `SETTLEMENT_DEFAULT_COMMISSION_RATE` | 0.1 | 정산 기본 수수료율 (정책 없을 때) |

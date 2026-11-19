@@ -79,7 +79,6 @@ export const config = {
     billing: { cron: process.env.JOB_BILLING_CRON ?? '0 21 * * *' },
     billingRetry: { cron: process.env.JOB_BILLING_RETRY_CRON ?? '0 20 * * *' },
     creditExpiryNotice: { cron: process.env.JOB_CREDIT_EXPIRY_NOTICE_CRON ?? '0 10 * * *' }, // 매일 10:00
-    rollingSchedule: { cron: process.env.JOB_ROLLING_SCHEDULE_CRON ?? '0 3 * * *' },
     autoSettlement: { cron: process.env.JOB_AUTO_SETTLEMENT_CRON ?? '0 4 1 * *' },
     systemHealthCheck: { cron: process.env.JOB_HEALTH_CHECK ?? '* * * * *' },
     holiday: { cron: process.env.JOB_HOLIDAY_CRON ?? '0 2 1 * *' }, // 매월 1일 02:00
@@ -88,7 +87,6 @@ export const config = {
     sessionComplete: { cron: process.env.JOB_SESSION_COMPLETE_CRON ?? '*/10 * * * *' }, // 10분마다
   },
   params: {
-    rollingHorizonDays: num(process.env.ROLLING_HORIZON_DAYS, 30),
     settlementDefaultUnitPrice: num(process.env.SETTLEMENT_DEFAULT_UNIT_PRICE, 10000),
     settlementDefaultCommissionRate: num(process.env.SETTLEMENT_DEFAULT_COMMISSION_RATE, 0.1),
     holidayHorizonMonths: num(process.env.HOLIDAY_HORIZON_MONTHS, 3),

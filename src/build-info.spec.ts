@@ -5,7 +5,7 @@ import { readBuildInfo } from './build-info';
 
 /**
  * 배포 확인용 값이라 **없거나 깨져도 던지면 안 된다.**
- * 배치는 기동 실패가 곧 정산·롤링 중단이므로 이 경로에서 예외가 새면 안 된다.
+ * 배치는 기동 실패가 곧 정산·수업 종료 처리 중단이므로 이 경로에서 예외가 새면 안 된다.
  */
 describe('readBuildInfo', () => {
   const dir = mkdtempSync(join(tmpdir(), 'batch-build-info-'));

@@ -6,7 +6,6 @@ import { runJob } from './utils/run-job';
 import { createJobLogger } from './logger';
 import { parseTestOptions, setTestOptions } from './utils/test-options';
 import * as billing from './jobs/subscription-billing.job';
-import * as rolling from './jobs/rolling-schedule.job';
 import * as settlement from './jobs/auto-settlement.job';
 import * as holiday from './jobs/holiday.job';
 import * as memberPurge from './jobs/member-purge.job';
@@ -19,7 +18,6 @@ type Exec = (log: ReturnType<typeof createJobLogger>) => Promise<void>;
 const registry: Record<string, { name: string; execute: Exec }> = {
   billing: { name: billing.PRIMARY_JOB_NAME, execute: billing.executePrimary },
   'billing-retry': { name: billing.RETRY_JOB_NAME, execute: billing.executeRetry },
-  rolling: { name: rolling.JOB_NAME, execute: rolling.execute },
   settlement: { name: settlement.JOB_NAME, execute: settlement.execute },
   holiday: { name: holiday.JOB_NAME, execute: holiday.execute },
   'member-purge': { name: memberPurge.JOB_NAME, execute: memberPurge.execute },

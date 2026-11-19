@@ -14,7 +14,7 @@ describe('parseTestOptions — 재현 테스트 전용 CLI 옵션', () => {
   afterEach(() => resetTestOptions());
 
   it('옵션이 없으면 빈 객체를 돌려주고 환경 검사도 하지 않는다 (모든 잡)', () => {
-    for (const job of ['billing', 'billing-retry', 'rolling', 'settlement']) {
+    for (const job of ['billing', 'billing-retry', 'settlement', 'holiday']) {
       expect(parseTestOptions(job, [], { NODE_ENV: 'production' })).toEqual({});
     }
   });
@@ -36,7 +36,7 @@ describe('parseTestOptions — 재현 테스트 전용 CLI 옵션', () => {
   });
 
   // N-8 재현 3 — 다른 잡에서 --as-of 가 today() 를 바꿔 수업 일정을 엉뚱한 시점으로 만들던 문제
-  it.each(['rolling', 'settlement', 'holiday', 'member-purge', 'session-complete'])('%s 잡에서는 --as-of/--member 를 거부한다', (job) => {
+  it.each(['settlement', 'holiday', 'member-purge', 'session-complete'])('%s 잡에서는 --as-of/--member 를 거부한다', (job) => {
     expect(() => parseTestOptions(job, ['--as-of', '2030-01-01'], LOCAL)).toThrow(/billing/);
     expect(() => parseTestOptions(job, ['--member', 'm1'], LOCAL)).toThrow(/billing/);
   });
@@ -54,7 +54,7 @@ describe('parseTestOptions — 재현 테스트 전용 CLI 옵션', () => {
   });
 
   it('옵션이 없는 잡에 알 수 없는 옵션만 있어도 거부한다 (오타를 조용히 무시하지 않는다)', () => {
-    expect(() => parseTestOptions('rolling', ['--dry-run'], LOCAL)).toThrow(/알 수 없는|옵션/);
+    expect(() => parseTestOptions('settlement', ['--dry-run'], LOCAL)).toThrow(/알 수 없는|옵션/);
   });
 
   it.each([undefined, '', 'prod', 'production', 'PRODUCTION', 'staging', 'prodd'])(

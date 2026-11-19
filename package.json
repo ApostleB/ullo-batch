@@ -1,7 +1,7 @@
 {
   "name": "ullo-batch",
   "version": "1.0.0",
-  "description": "ullo 배치 시스템 (구독 자동결제 / 반복 스케줄 롤링 생성 / 정산 자동 생성)",
+  "description": "ullo 배치 시스템 (구독 자동결제 / 정산 자동 생성 / 공휴일 동기화 / 수업 종료 처리)",
   "license": "ISC",
   "main": "dist/index.js",
   "scripts": {
